@@ -95,15 +95,13 @@ internal object OfflineDash {
             // matches what OfflineHls produces for the same stream — the
             // `#EXT-X-MAP` fragment is index 0 there too.
             val remotes = listOf(plan.initialization) + plan.media
-            remotes.forEachIndexed { index, remote ->
+            val parts = SegmentParts(File(DownloadParts.root(context, id), "segments"), manifest,
+                remotes.map { base.resolve(it)?.toString() ?: error("Invalid DASH segment") }, headers)
+            onProgress(parts.completed().toLong(), remotes.size.toLong())
+            remotes.forEachIndexed { index, _ ->
                 coroutineContext.ensureActive()
-                val target = base.resolve(remote)?.toString() ?: error("Invalid DASH segment")
-                Http.client.newCall(request(target)).execute().use { response ->
-                    if (!response.isSuccessful) error("DASH segment failed (HTTP ${response.code})")
-                    val body = response.body?.byteStream() ?: error("Empty DASH segment")
-                    body.use { input -> File(root, localName(index)).outputStream().use(input::copyTo) }
-                }
-                onProgress((index + 1).toLong(), remotes.size.toLong())
+                parts.fetch(index).copyTo(File(root, localName(index)), overwrite = true)
+                onProgress(parts.completed().toLong(), remotes.size.toLong())
             }
 
             File(root, "playlist.m3u8").writeText(playlist(plan))

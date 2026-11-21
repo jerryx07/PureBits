@@ -19,15 +19,45 @@ class AppUpdateCheckerTest {
         }
     }
 
-    @Test fun selectsExistingPublishedUniversalApk() {
-        val name = "app-prod-universal-release.apk"
-        val selected = AppUpdateChecker.apkAssetUrl(release("app-prod-arm64-v8a-release.apk", name), listOf("arm64-v8a"))
+    @Test fun prefersDeviceApkOverUniversal() {
+        val name = "app-prod-arm64-v8a-release.apk"
+        val selected = AppUpdateChecker.apkAssetUrl(release("app-prod-universal-release.apk", name), listOf("arm64-v8a"))
         assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
     }
 
     @Test fun usesDeviceAbiOrderWhenUniversalIsMissing() {
         val name = "app-prod-arm64-v8a-release.apk"
         val selected = AppUpdateChecker.apkAssetUrl(release("app-prod-armeabi-v7a-release.apk", name), listOf("arm64-v8a", "armeabi-v7a"))
+        assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
+    }
+
+    @Test fun usesACompatibleSecondaryAbiBeforeUniversal() {
+        val name = "app-prod-armeabi-v7a-release.apk"
+        val selected = AppUpdateChecker.apkAssetUrl(
+            release("app-prod-universal-release.apk", "app-prod-x86_64-release.apk", name),
+            listOf("arm64-v8a", "armeabi-v7a"),
+        )
+        assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
+    }
+
+    @Test fun universalIsTheFallbackForAnUnsupportedDeviceSplit() {
+        val name = "app-prod-universal-release.apk"
+        val selected = AppUpdateChecker.apkAssetUrl(release("app-prod-arm64-v8a-release.apk", name), listOf("x86_64"))
+        assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
+    }
+
+    @Test fun versionedSplitBeatsUniversalAndLowerPriorityGradleSplit() {
+        val name = "PureBits-v2.4_arm64-v8a.apk"
+        val selected = AppUpdateChecker.apkAssetUrl(
+            release("app-prod-universal-release.apk", "app-prod-armeabi-v7a-release.apk", name),
+            listOf("arm64-v8a", "armeabi-v7a"),
+        )
+        assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
+    }
+
+    @Test fun unknownDeviceArchitectureStillAllowsUniversal() {
+        val name = "app-prod-universal-release.apk"
+        val selected = AppUpdateChecker.apkAssetUrl(release("app-prod-arm64-v8a-release.apk", name), emptyList())
         assertEquals("https://github.com/bijimathew/PureBits/releases/download/2.4/$name", selected)
     }
 

@@ -9,6 +9,7 @@ import com.music.bitchord.data.DebugLog as Log
 import androidx.core.content.ContextCompat
 import com.music.bitchord.data.innertube.StreamResolver
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.Http
 import com.music.bitchord.data.settings.AppSettings
 import com.music.bitchord.data.settings.DownloadQuality
 import com.music.bitchord.data.sources.SourceRegistry
@@ -148,6 +149,7 @@ object Downloads {
     private val running = LinkedHashMap<String, Job?>()
 
     fun init(context: Context) {
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch { DownloadParts.prune(context.applicationContext) }
         prefs = context.getSharedPreferences("bitchord_settings", Context.MODE_PRIVATE)
         _saved.value = runCatching {
             json.decodeFromString(serializer, prefs.getString(KEY_SAVED, null) ?: "{}")
@@ -947,28 +949,32 @@ object Downloads {
      * atomic updates for exactly that reason.
      */
     internal suspend fun run(context: Context, song: Song) = withContext(Dispatchers.IO) {
-        val id = song.videoId
-        // Set before the lookup, not after it. Resolving where a lossless track
-        // comes from is the long part of a download, and leaving the row on
-        // "Queued" for all of it reads as a queue that has stopped rather than
-        // one that is working.
-        _active.update { it + (id to DownloadState.Running(0f)) }
-        DownloadSession.running(id, 0f)
+        DownloadParts.withTrack(song.videoId) {
+            val id = song.videoId
+            // Set before the lookup, not after it. Resolving where a lossless track
+            // comes from is the long part of a download, and leaving the row on
+            // "Queued" for all of it reads as a queue that has stopped rather than
+            // one that is working.
+            val retainedFraction = DownloadParts.fraction(context, id)
+            _active.update { it + (id to DownloadState.Running(retainedFraction)) }
+            DownloadSession.running(id, retainedFraction)
 
-        try {
-            val plan = prepare(context, song)
-            // The manager is showing the row that was tapped, which for a music
-            // video is the wrong title and the wrong cover for the file actually
-            // being written. Corrected here rather than left to disagree with
-            // the notification and with the Downloads page afterwards.
-            DownloadSession.retitle(id, plan.track)
-            transfer(context, song, plan)
-        } catch (e: CancellationException) {
-            clear(id)
-            throw e
-        } catch (e: Exception) {
-            Log.w(TAG, "download failed for $id: ${e.message}", e)
-            fail(id, e.friendly())
+            try {
+                val plan = prepare(context, song)
+                // The manager is showing the row that was tapped, which for a music
+                // video is the wrong title and the wrong cover for the file actually
+                // being written. Corrected here rather than left to disagree with
+                // the notification and with the Downloads page afterwards.
+                DownloadSession.retitle(id, plan.track)
+                transfer(context, song, plan)
+            } catch (e: CancellationException) {
+                DownloadParts.clear(context, id)
+                clear(id)
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "download failed for $id: ${e.message}", e)
+                fail(id, e.friendly())
+            }
         }
     }
 
@@ -999,7 +1005,7 @@ object Downloads {
         // download or its filename.
         val track = song
         // Read once, here, for the whole of this track. Both routes below
-        // and the re-resolve inside [Downloader.fetch] have to agree on
+        // and the re-resolve inside [Downloader.fetchResumable] have to agree on
         // which rung they are fetching, and re-reading the setting per call
         // would let a change made mid-download splice two renditions into
         // one file.
@@ -1070,7 +1076,7 @@ object Downloads {
      *
      * Owns the destination from end to end: every exit out of here either
      * commits or aborts, so a caller is free to call it a second time with a
-     * freshly resolved plan without the first attempt leaving anything behind.
+     * freshly resolved plan. Only private resumable checkpoints survive a failure.
      */
     private suspend fun transfer(context: Context, song: Song, plan: Prepared) {
         val id = song.videoId
@@ -1079,6 +1085,7 @@ object Downloads {
         // Already there from a previous run the record lost track of — adopt it
         // rather than writing a second copy beside it.
         plan.alreadyAt?.let { uri ->
+            DownloadParts.clear(context, id)
             remember(song, track, uri)
             DownloadSession.done(id)
             clear(id)
@@ -1114,6 +1121,7 @@ object Downloads {
                 val name = DownloadStore.fileNameFor(track, route.extension)
                 val alreadyThere = DownloadStore.existing(context, name)
                 if (alreadyThere != null) {
+                    DownloadParts.clear(context, id)
                     Log.d(TAG, "$name is already in Music; adopting it")
                     remember(song, track, alreadyThere)
                     DownloadSession.done(id)
@@ -1150,6 +1158,7 @@ object Downloads {
                         )
                     }
                     remember(song, track, savedUri, route.downloadFormat)
+                    DownloadParts.clear(context, id)
                     DownloadSession.done(id)
                     clear(id)
                     Log.d(TAG, "saved offline ${if (manifest.dash) "DASH" else "HLS"} package for $name")
@@ -1159,7 +1168,7 @@ object Downloads {
                 val destination = DownloadStore.begin(context, name, route.mimeType)
                 pending = destination
                 destination.openStream().use { sink ->
-                    route.write(sink) { written, total ->
+                    route.write(DownloadParts.root(context, id), sink) { written, total ->
                         val fraction = written.toFloat() / total
                         _active.update { it + (id to DownloadState.Running(fraction)) }
                         DownloadSession.running(id, fraction)
@@ -1174,6 +1183,7 @@ object Downloads {
                 val savedUri = destination.commit()
                 pending = null
                 remember(song, track, savedUri, route.downloadFormat, artworkUri)
+                DownloadParts.clear(context, id)
                 DownloadSession.done(id)
                 clear(id)
                 Log.d(TAG, "saved $name")
@@ -1211,7 +1221,7 @@ object Downloads {
         val downloadFormat: String? = null,
         val taggable: Boolean = true,
         val offlineHls: Manifest? = null,
-        val write: suspend (OutputStream, (written: Long, total: Long) -> Unit) -> Unit,
+        val write: suspend (File, OutputStream, (written: Long, total: Long) -> Unit) -> Unit,
     )
 
     /**
@@ -1241,7 +1251,7 @@ object Downloads {
      *
      * @param quality read once by the caller and passed down, so that a setting
      *   changed while this track is in the queue applies to the next one rather
-     *   than to the middle of this one. [Downloader.fetch] resolves again after
+     *   than to the middle of this one. [Downloader.fetchResumable] resolves again after
      *   a mid-download refusal and has to ask for the same rung it started on.
      */
     private suspend fun routeFor(context: Context, track: Song, quality: DownloadQuality): Route {
@@ -1268,8 +1278,9 @@ object Downloads {
             mimeType = stream.downloadMimeType,
             describe = "${stream.kbps}kbps ${stream.mimeType}",
             downloadFormat = youtubeDownloadBadge(stream.downloadExtension, stream.kbps),
-            write = { sink, onProgress ->
-                Downloader.fetch(track.videoId, stream, quality.maxKbps, requireM4a, sink, onProgress)
+            write = { parts, sink, onProgress ->
+                Downloader.fetchResumable(track.videoId, stream, quality.maxKbps, requireM4a, File(parts, "audio.part"), onProgress)
+                    .inputStream().use { input -> input.copyTo(sink) }
             },
         )
     }
@@ -1293,8 +1304,9 @@ object Downloads {
                 mimeType = probe.container.mimeType,
                 describe = stream.format.summary,
                 downloadFormat = stream.format.downloadBadge(),
-                write = { sink, onProgress ->
-                    Downloader.fetchDirect(stream.url, stream.headers, sink, onProgress)
+                write = { parts, sink, onProgress ->
+                    ResumableTransfer.download(Http.client, stream.url, stream.headers, File(parts, "audio.part"), onProgress)
+                        .inputStream().use { input -> input.copyTo(sink) }
                 },
             )
             is Downloader.Probe.Manifest -> {
@@ -1313,10 +1325,10 @@ object Downloads {
                         mimeType = assembled.mimeType,
                         describe = "${stream.format.summary} (assembled from ${if (dash) "DASH" else "HLS"})",
                         downloadFormat = stream.format.downloadBadge(),
-                        write = { sink, onProgress ->
+                        write = { parts, sink, onProgress ->
                             ManifestFile.write(
                                 context.cacheDir, stream.url, stream.headers, dash,
-                                assembled.extension, sink, onProgress,
+                                assembled.extension, sink, onProgress, File(parts, "segments"),
                             )
                         },
                     )
@@ -1335,9 +1347,7 @@ object Downloads {
                         describe = stream.format.summary,
                         downloadFormat = stream.format.downloadBadge(),
                         offlineHls = Manifest(stream.url, stream.headers, dash = dash),
-                        write = { sink, onProgress ->
-                            Downloader.fetchDirect(stream.url, stream.headers, sink, onProgress)
-                        },
+                        write = { _, _, _ -> error("Manifest downloads use their offline package writer") },
                     )
                 }
             }
@@ -1357,7 +1367,7 @@ object Downloads {
             mimeType = copy.mimeType,
             describe = "song cache, ${copy.length} bytes",
             downloadFormat = if (copy.extension == "flac") "FLAC" else null,
-            write = { sink, onProgress -> AudioCache.copyOut(copy, sink, onProgress) },
+            write = { _, sink, onProgress -> AudioCache.copyOut(copy, sink, onProgress) },
         )
     }
 

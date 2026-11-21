@@ -51,17 +51,15 @@ internal object OfflineHls {
             }
             if (references.isEmpty()) error("HLS playlist has no fragments")
             val localNames = linkedMapOf<String, String>()
+            val parts = SegmentParts(File(DownloadParts.root(context, id), "segments"), playlist,
+                references.distinct().map { base.resolve(it)?.toString() ?: error("Invalid HLS fragment") }, headers)
+            onProgress(parts.completed().toLong(), references.distinct().size.toLong())
             references.distinct().forEachIndexed { index, remote ->
                 coroutineContext.ensureActive()
-                val target = base.resolve(remote)?.toString() ?: error("Invalid HLS fragment")
                 val local = "segment-${index.toString().padStart(5, '0')}.m4s"
-                Http.client.newCall(request(target)).execute().use { response ->
-                    if (!response.isSuccessful) error("HLS fragment failed (HTTP ${response.code})")
-                    response.body?.byteStream()?.use { input -> File(root, local).outputStream().use(input::copyTo) }
-                        ?: error("Empty HLS fragment")
-                }
+                parts.fetch(index).copyTo(File(root, local), overwrite = true)
                 localNames[remote] = local
-                onProgress((index + 1).toLong(), references.distinct().size.toLong())
+                onProgress(parts.completed().toLong(), references.distinct().size.toLong())
             }
             val localPlaylist = playlist
                 .replace(Regex("""(URI=\")([^\"]+)(\")""")) { match ->

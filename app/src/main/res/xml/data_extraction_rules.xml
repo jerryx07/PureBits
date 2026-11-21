@@ -6,6 +6,7 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="purebits_download_exports.xml" />
+        <exclude domain="sharedpref" path="purebits_personal.xml" />
         <exclude domain="sharedpref" path="bitchord_auth.xml" />
         <exclude domain="sharedpref" path="bitchord_auth_plain.xml" />
         <exclude domain="sharedpref" path="bitchord_sources.xml" />
@@ -19,6 +20,7 @@
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="purebits_download_exports.xml" />
+        <exclude domain="sharedpref" path="purebits_personal.xml" />
         <exclude domain="sharedpref" path="bitchord_auth.xml" />
         <exclude domain="sharedpref" path="bitchord_auth_plain.xml" />
         <exclude domain="sharedpref" path="bitchord_sources.xml" />

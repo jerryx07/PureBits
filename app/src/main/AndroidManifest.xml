@@ -126,6 +126,7 @@
           uiMode is deliberately *not* in the list: a day/night change should
           still recreate the Activity so the theme is rebuilt from resources.
         -->
+        <activity android:name=".ui.PrivateSyncActivity" android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

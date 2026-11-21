@@ -55,6 +55,7 @@ internal object ManifestFile {
         extension: String,
         sink: OutputStream,
         onProgress: (Long, Long) -> Unit,
+        checkpointDir: File,
     ): Unit = withContext(Dispatchers.IO) {
         fun fetch(target: String): ByteArray {
             val request = Request.Builder().url(target).apply {
@@ -76,16 +77,16 @@ internal object ManifestFile {
         fun resolve(ref: String) = base.resolve(ref)?.toString() ?: error("Invalid segment URL")
         val total = mediaRefs.size + 1L
 
-        val init = fetch(resolve(initRef))
-        onProgress(1, total)
-        // Lazy, so a hi-res track is never more than one segment in memory.
-        val scope = coroutineContext
-        val media = mediaRefs.asSequence().mapIndexed { i, ref ->
-            scope.ensureActive()
-            fetch(resolve(ref)).also { onProgress(i + 2L, total) }
+        val urls = (listOf(initRef) + mediaRefs).map(::resolve)
+        val parts = SegmentParts(checkpointDir, index, urls, headers)
+        onProgress(parts.completed().toLong(), total)
+        val files = urls.indices.map { i ->
+            coroutineContext.ensureActive()
+            parts.fetch(i).also { onProgress(parts.completed().toLong(), total) }
         }
-
-        assemble(cacheDir, extension, init, media, sink)
+        // Assembly is repeated locally after an interrupted attempt; completed
+        // network segments are retained and never published as a partial song.
+        assemble(cacheDir, extension, files.first().readBytes(), files.drop(1).asSequence().map { it.readBytes() }, sink)
         sink.flush()
     }
 

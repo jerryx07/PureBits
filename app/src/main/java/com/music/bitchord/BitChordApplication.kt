@@ -202,6 +202,7 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
         // The public "apps open right now" count; see Presence.
         com.music.bitchord.data.presence.AndroidPresence.install(this)
         backgroundInit.join()
+        com.music.bitchord.data.personal.PrivateSync.init(this)
     }
 
     /**

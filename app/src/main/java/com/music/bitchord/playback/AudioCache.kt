@@ -10,12 +10,15 @@ import com.music.bitchord.R
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.playback.smart.AutomixAnalysisSource
 import androidx.media3.common.C
+import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSink
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.TransferListener
 import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.CacheDataSink
 import androidx.media3.datasource.cache.CacheKeyFactory
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.ContentMetadata
@@ -84,6 +87,8 @@ object AudioCache {
      * ceiling rather than something the listener has to manage day to day.
      */
     private val evictor = DynamicLruCacheEvictor(AppSettings.DEFAULT_CACHE_LIMIT_BYTES)
+    private lateinit var losslessReplay: LosslessReplayCache
+    private val openCacheKeys = ConcurrentHashMap<String, Int>()
 
     /**
      * How much of the next track to fetch. About 50 seconds at 160kbps — long
@@ -228,6 +233,7 @@ object AudioCache {
         val databaseProvider = StandaloneDatabaseProvider(context)
         migrateFromCacheDir(File(context.cacheDir, LEGACY_CACHE_DIR_NAME), dir, databaseProvider)
         cache = SimpleCache(dir, evictor, databaseProvider)
+        losslessReplay = LosslessReplayCache(cache, ::readCachedBytes)
         // Builds before album/explicit/video-aware and credit-aware matching
         // may have cached a completely different recording under a YouTube
         // track's `#alt` key.
@@ -290,6 +296,7 @@ object AudioCache {
     /** Drops everything on disk. The listener asked; no grace period. */
     fun clear(onComplete: () -> Unit = {}) {
         cancel()
+        if (::losslessReplay.isInitialized) losslessReplay.resetActivations()
         // The bookkeeping describes bytes that are about to stop existing: a
         // one-round-per-track claim over an entry that just got deleted starts
         // nothing on the next switch until the wait's settle pass evicts it,
@@ -335,6 +342,7 @@ object AudioCache {
      *   playing offline used to delete the very songs it was playing.
      */
     fun discard(uri: Uri, keepComplete: Boolean = false) {
+        losslessReplay.resetActivations()
         val exact = keyFactory.buildCacheKey(DataSpec(uri))
         val about = mediaIdIn(uri)
         val family = uri.getQueryParameter("v")?.let { videoId ->
@@ -437,7 +445,12 @@ object AudioCache {
         if (spec.uri.getQueryParameter(WATCH_READ_PARAM) != null) "$key#watch" else key
     }
 
-    private fun phoneKey(spec: androidx.media3.datasource.DataSpec): String =
+    private fun phoneKey(spec: DataSpec): String {
+        val preferred = streamKey(spec)
+        return replayCopy(spec.uri, preferred)?.key ?: preferred
+    }
+
+    private fun streamKey(spec: DataSpec): String =
         spec.uri.getQueryParameter("v")
             // A YouTube id can name several different recordings on disk: the
             // Opus rendition YouTube serves, whatever a source ranked above it
@@ -466,8 +479,8 @@ object AudioCache {
                 when {
                     rendition != null -> "$videoId#$rendition"
                     SourceResolver.canSubstituteForYouTube() ->
-                        "$videoId#alt${atmosKeySuffix()}".let { completeSibling(videoId, it) ?: it }
-                    else -> completeSibling(videoId, videoId) ?: videoId
+                        "$videoId#alt${atmosKeySuffix()}"
+                    else -> videoId
                 }
             }
             // A source-backed track keys on the source and its track id alone.
@@ -491,57 +504,6 @@ object AudioCache {
             }
             ?: spec.key
             ?: spec.uri.toString()
-
-    /**
-     * The complete copy of [videoId] the cache holds under a sibling key, when
-     * [preferred] — the key the current settings name — holds nothing at all.
-     *
-     * Which key a track lands under depends on settings that can change after
-     * it was cached: ranking a source above YouTube, or turning Dolby Atmos
-     * off, moves it from `videoId` to `videoId#alt` or `#alt-noatmos`, and
-     * un-ranking it moves it back. Offline that made a track the Cached songs
-     * folder lists — fully on disk — fail to play at all, because the player
-     * asked for an empty entry and the network to fill it was not there.
-     *
-     * Only for a copy that is complete: a complete entry is never written to
-     * again, so reading it cannot start the mixed-file seam [phoneKey] keeps
-     * renditions apart to prevent.
-     *
-     * Online it depends on the direction. With a source ranked above YouTube
-     * the preferred `#alt` key keeps its own rendition — falling back to the
-     * plain entry would hand back a YouTube Opus copy in place of the better
-     * one a source would resolve, and `#alt` against `#alt-noatmos` is the
-     * Atmos setting itself. With nothing ranked above YouTube, the plain key
-     * would only ever resolve the same YouTube stream, so a kept YouTube or
-     * JioSaavn copy under `#alt` is taken online too. Measured: East Side Flow
-     * cached under `#alt` while a source was ranked first, the source then
-     * dropped — every online play re-resolved through InnerTubeX and wrote a
-     * second, byte-identical 3.8 MB itag 251 file under the plain key, while
-     * offline plays came straight off disk.
-     */
-    private fun completeSibling(videoId: String, preferred: String): String? {
-        if (!::cache.isInitialized) return null
-        // Ahead of the connectivity check, which is a binder call: nearly every
-        // open is of an entry that already holds something.
-        if (cache.getCachedSpans(preferred).isNotEmpty()) return null
-        val siblings = listOf(videoId, "$videoId$ALT_SUFFIX", "$videoId$ALT_SUFFIX-noatmos")
-            .filter { it != preferred }
-        if (isOffline()) return siblings.firstOrNull(::isComplete)
-        if (preferred != videoId) return null
-        return siblings.firstOrNull { key -> isComplete(key) && isKeptOrigin(key) }
-    }
-
-    /**
-     * Whether [key]'s bytes came from YouTube or JioSaavn — see [Origin]. An
-     * addon's file can sit under `#alt` too, as an Atmos or lossless rendition
-     * kept from an earlier play, and is not taken here: with nothing ranked
-     * above YouTube any more, the addon that served it is no longer one the
-     * listener has asked to hear.
-     */
-    private fun isKeptOrigin(key: String): Boolean = runCatching {
-        val origin = cache.getContentMetadata(key).get(META_ORIGIN, null as String?)
-        origin == Origin.YOUTUBE.name || origin == Origin.JIOSAAVN.name
-    }.getOrDefault(false)
 
     /**
      * Who filled the entry the player reads [uri] from, as [recordServed]
@@ -635,7 +597,7 @@ object AudioCache {
      * Everything else — an addon's or a module's stream, a lossless upgrade
      * from one of them — is [OTHER]: kept when it is a whole audio file that
      * the track's own entry will read again, dropped by [dropForeignEntries]
-     * otherwise. See [keepsAddonCopy]. None of it is read ahead whole the way
+     * otherwise. See [LosslessReplayCache]. None of it is read ahead whole the way
      * YouTube's and JioSaavn's are ([fetchWhole]): an addon's file is filled by
      * being played, past the one head [prefetchDirect] takes so the next track
      * can start on time.
@@ -771,6 +733,8 @@ object AudioCache {
         val mediaId = mediaIdIn(spec.uri) ?: return
         val key = spec.key ?: keyFactory.buildCacheKey(spec)
         val origin = originOf(spec.uri, mediaId, servedUrl)
+        losslessReplay.resolved(key, servedUrl,
+            if (origin == Origin.YOUTUBE) false else com.music.bitchord.data.NerdStats.declaredFormat(mediaId)?.isLossless)
         val sourceConfigId = servingSourceConfigId(spec.uri, mediaId, servedUrl)
         val song = notedSongs[mediaId]
         // Automix's analysis-only read: its own YouTube Opus download, made
@@ -883,6 +847,7 @@ object AudioCache {
         )
         val byTrack = LinkedHashMap<String, MutableList<Entry>>()
         for (key in cache.keys) {
+            if (losslessReplay.copy(key) == null) continue
             val meta = runCatching { cache.getContentMetadata(key) }.getOrNull() ?: continue
             val origin = meta.get(META_ORIGIN, null as String?)
                 ?.let { runCatching { Origin.valueOf(it) }.getOrNull() }
@@ -968,6 +933,7 @@ object AudioCache {
      * @return how many entries went.
      */
     suspend fun remove(mediaId: String): Int = withContext(Dispatchers.IO) {
+        if (::losslessReplay.isInitialized) losslessReplay.resetActivations()
         if (!::cache.isInitialized || mediaId.isBlank()) return@withContext 0
         playedIds.remove(mediaId)
         analysisHeads.remove(mediaId)
@@ -1017,7 +983,7 @@ object AudioCache {
         return keysOf(mediaId)
             .filterNot { it.endsWith("#watch") }
             // Never an addon's own file. Those are kept to be *played* — see
-            // [keepsAddonCopy] — and an addon whose manifest says
+            // [LosslessReplayCache] — and an addon whose manifest says
             // `allowDownloads: 0` plays but does not download. Copying its file
             // out of the cache would be a download it was never asked about,
             // so the network route decides instead, where that rule is applied.
@@ -1088,38 +1054,17 @@ object AudioCache {
         }
     }
 
-    /**
-     * Drops every entry an addon or module filled ([Origin.OTHER]) that cannot
-     * be kept — see [keepsAddonCopy] — and every copy Automix downloaded for
-     * analysis alone that playback never read, except the ones belonging to
-     * [keep]: the tracks around the playhead, whose bytes are still being
-     * read, seeked through and analysed.
-     *
-     * A complete addon copy stays, and plays straight off disk next time —
-     * after a restart, or with no connection at all. What goes is what cannot
-     * be finished safely: a partial addon file has nobody left to finish it
-     * once its signed URL and its [StreamChoice] are gone, and the next
-     * resolve may land on a different file and stream it into the middle.
-     * Analysis results are kept in their own store, so the analysis-only
-     * audio has done its job by then.
-     *
-     * @param keepAnalysis leaves the analysis-only copies alone, for a caller
-     *   that is only after the addon entries — a lowered quality ceiling, which
-     *   says nothing about Automix's YouTube Opus heads for the tracks ahead.
-     */
-    fun dropForeignEntries(keep: Set<String>, keepAnalysis: Boolean = false) {
+    /** Keeps complete lossless recordings and their segments; other bytes are temporary queue buffers. */
+    fun dropForeignEntries(keep: Set<String>) {
         if (!::cache.isInitialized) return
         scope.launch {
+            val protected = losslessReplay.protectedKeys(keep)
             var dropped = 0
             cache.keys.toList().forEach { key ->
+                if (key in protected || openCacheKeys.containsKey(key)) return@forEach
                 val meta = runCatching { cache.getContentMetadata(key) }.getOrNull() ?: return@forEach
-                val foreign = meta.get(META_ORIGIN, null as String?) == Origin.OTHER.name &&
-                    !keepsAddonCopy(key)
-                val analysisOnly = !keepAnalysis &&
-                    meta.get(META_ANALYSIS, null as String?) != null &&
-                    meta.get(META_PLAYBACK, null as String?) == null &&
-                    meta.get(META_PLAYED, null as String?) == null
-                if (!foreign && !analysisOnly) return@forEach
+                // Only complete lossless copies survive outside the active queue
+                // window. Lossy audio and analysis heads are temporary buffers.
                 val mediaId = meta.get(META_MEDIA_ID, null as String?)
                 if (mediaId != null && mediaId in keep) return@forEach
                 runCatching { cache.removeResource(key) }
@@ -1133,28 +1078,10 @@ object AudioCache {
                     }
                     .onFailure { TrackLog.d(TAG, "unkept cache entry $key still in use: ${it.message}") }
             }
-            if (dropped > 0) TrackLog.d(TAG, "dropped $dropped addon / analysis-only cache entries")
+            if (dropped > 0) TrackLog.d(TAG, "dropped $dropped temporary audio cache entries")
         }
     }
 
-    /**
-     * Whether the addon or module file under [key] is worth keeping once the
-     * queue has moved past it. Three things, each ruling out a copy that would
-     * do harm if it were read again:
-     *
-     *  - **Complete.** A whole entry is never written to again, so it can't
-     *    become the mixed-file seam a partial one is.
-     *  - **Not a session's marked rendition.** A `#hifi` or manual `#addon-`
-     *    entry depends on the in-memory stream behind its marked item. Once
-     *    that choice is gone, keeping its bytes leaves an unreadable entry.
-     *  - **Audio, by its first bytes.** Tidal answers with a DASH manifest, and
-     *    the XML lands under the track's own key; kept, the next play would
-     *    read a manifest of expired segment URLs off disk as if it were the
-     *    song. WebM, MP4 and FLAC pass, as [cachedContainerOf] reads them.
-     */
-    private fun keepsAddonCopy(key: String): Boolean =
-        !key.contains("#hifi") && !key.contains("#${AddonSwitch.PREFIX}") &&
-            isComplete(key) && containerOf(key) != null
 
     /** The part of a cache key that names the track, before any `#rendition`; see [keyFactory]. */
     private fun cacheKeyBaseOf(mediaId: String): String =
@@ -1217,16 +1144,33 @@ object AudioCache {
         val upstreamDs = upstream.createDataSource()
         object : DataSource {
             private var activeDs: DataSource = cacheDs
+            private var openedKey: String? = null
+            private val listeners = mutableListOf<TransferListener>()
 
             override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) {
+                listeners += transferListener
                 cacheDs.addTransferListener(transferListener)
                 upstreamDs.addTransferListener(transferListener)
             }
 
             override fun open(dataSpec: DataSpec): Long {
                 val scheme = dataSpec.uri.scheme
+                val key = keyFactory.buildCacheKey(dataSpec)
+                openedKey = key
+                openCacheKeys.compute(key) { _, count -> (count ?: 0) + 1 }
+                val replay = replayCopy(dataSpec.uri, streamKey(dataSpec))
                 activeDs = if (scheme == "file" || scheme == "content") {
                     upstreamDs
+                } else if (replay != null || losslessReplay.isReplaySegment(key)) {
+                    replay?.let {
+                        losslessReplay.activate(it)
+                        TrackLog.d(TAG, "playing complete lossless cache", about = mediaIdIn(dataSpec.uri))
+                    }
+                    // No upstream: eviction or a missing segment must fail rather
+                    // than silently append bytes from a newly resolved recording.
+                    CacheDataSource.Factory().setCache(cache)
+                        .setCacheKeyFactory { replay?.key ?: key }.createDataSource()
+                        .also { source -> listeners.forEach(source::addTransferListener) }
                 } else {
                     settleDirectEntry(dataSpec.uri)
                     cacheDs
@@ -1240,7 +1184,13 @@ object AudioCache {
             override fun getUri(): Uri? = activeDs.uri
 
             override fun close() {
-                activeDs.close()
+                try { activeDs.close() } finally {
+                    openedKey?.let { key ->
+                        openCacheKeys.computeIfPresent(key) { _, count -> (count - 1).takeIf { it > 0 } }
+                        scope.launch { runCatching { losslessReplay.inspect(key) } }
+                    }
+                    openedKey = null
+                }
             }
         }
     }
@@ -1269,6 +1219,7 @@ object AudioCache {
      * way on a direct-mode miss.
      */
     private fun settleDirectEntry(uri: Uri) {
+        if (hasLosslessReplay(uri)) return
         if (uri.scheme != "bitchord" || uri.authority != "watch") return
         val videoId = uri.getQueryParameter("v") ?: return
         // A rendition of its own (an upgrade, a revert), the watch's capped
@@ -1333,6 +1284,30 @@ object AudioCache {
         .setCache(cache)
         .setUpstreamDataSourceFactory(upstream)
         .setCacheKeyFactory(keyFactory)
+        .setCacheWriteDataSinkFactory {
+            val disk = CacheDataSink.Factory().setCache(cache).createDataSink()
+            object : DataSink {
+                private var key: String? = null
+                private var writing = false
+                override fun open(dataSpec: DataSpec) {
+                    key = dataSpec.key ?: keyFactory.buildCacheKey(dataSpec)
+                    if (losslessReplay.mayWrite(key!!)) {
+                        disk.open(dataSpec)
+                        writing = true
+                    }
+                }
+                override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                    if (writing && !losslessReplay.mayWrite(key!!)) close()
+                    if (writing) disk.write(buffer, offset, length)
+                }
+                override fun close() {
+                    if (writing) {
+                        writing = false
+                        disk.close()
+                    }
+                }
+            }
+        }
         // A cache write that fails (full disk, evicted mid-write) should drop
         // to streaming, not surface as a playback error.
         .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
@@ -1366,6 +1341,70 @@ object AudioCache {
     fun setUpstream(factory: DataSource.Factory) {
         upstreamFactory = factory
     }
+
+    private fun replayCopy(uri: Uri, preferred: String): LosslessReplayCache.Copy? {
+        if (!::losslessReplay.isInitialized || uri.scheme != "bitchord" ||
+            uri.getQueryParameter(DIRECT_YOUTUBE_PARAMETER) == "1" ||
+            uri.getQueryParameter(WATCH_READ_PARAM) != null ||
+            AutomixAnalysisSource.requestsYouTubeOpus(uri.getQueryParameter(AutomixAnalysisSource.OPUS_QUERY_PARAMETER))
+        ) return null
+        val id = mediaIdIn(uri) ?: return null
+        return runCatching {
+            losslessReplay.best(
+                id,
+                exactKey = preferred.takeIf { QualityUpgrade.cacheTag(uri) != null },
+                stereo = if (uri.authority == "source")
+                    uri.getQueryParameter(SourceResolver.MIX_PARAM) == SourceResolver.MIX_STEREO else null,
+            )
+        }.getOrNull()
+    }
+
+    fun hasLosslessReplay(uri: Uri): Boolean = replayCopy(uri, streamKey(DataSpec(uri))) != null
+
+    fun hasLosslessReplay(mediaId: String): Boolean = ::losslessReplay.isInitialized &&
+        !OriginalVersion.isPinned(mediaId) && runCatching { losslessReplay.best(mediaId) != null }.getOrDefault(false)
+
+    /** The media source must know a retained playlist's type before opening its bytes. */
+    fun forCachedPlayback(item: MediaItem): MediaItem {
+        val uri = item.localConfiguration?.uri ?: return item
+        val copy = replayCopy(uri, streamKey(DataSpec(uri))) ?: return item
+        losslessReplay.activate(copy)
+        return item.buildUpon().setMimeType(copy.mime).build()
+    }
+
+    fun noteDecodedFormat(uri: Uri?, mime: String?, depth: Int?, rate: Int?) {
+        if (!::losslessReplay.isInitialized || uri?.scheme != "bitchord") return
+        val key = keyFactory.buildCacheKey(DataSpec(uri))
+        runCatching { losslessReplay.decoded(key, mime, depth, rate) }
+    }
+
+    /** A manually rejected match must not win cache selection on the next play. */
+    fun rejectCachedRecordings(mediaId: String) {
+        if (!::losslessReplay.isInitialized) return
+        losslessReplay.reject(mediaId)
+        // The normal key must not later serve the rejected recording either.
+        // Existing readers retain their open file until the immediate source swap.
+        keysOf(mediaId).forEach { key -> runCatching { cache.removeResource(key) } }
+    }
+
+    private fun readCachedBytes(key: String, limit: Int): ByteArray? = runCatching {
+        val length = ContentMetadata.getContentLength(cache.getContentMetadata(key))
+        if (length <= 0) return null
+        val wanted = minOf(length, limit.toLong()).toInt()
+        if (!cache.isCached(key, 0, wanted.toLong())) return null
+        val source = CacheDataSource.Factory().setCache(cache).setCacheKeyFactory { key }.createDataSource()
+        try {
+            source.open(DataSpec.Builder().setUri("https://cache.invalid/audio").setLength(wanted.toLong()).build())
+            val bytes = ByteArray(wanted)
+            var offset = 0
+            while (offset < wanted) {
+                val count = source.read(bytes, offset, wanted - offset)
+                if (count <= 0) return null
+                offset += count
+            }
+            bytes
+        } finally { source.close() }
+    }.getOrNull()
 
     private var job: Job? = null
     private var pendingQueue: List<String> = emptyList()
@@ -1410,6 +1449,7 @@ object AudioCache {
         // typically a good deal closer than googlevideo anyway.
         //
         val videoIds = mediaIds.filter { SourceRegistry.parseTrackKey(it) == null }
+            .filterNot(::hasLosslessReplay)
             // A track already on disk needs no reading ahead, and read-ahead
             // speaks only to googlevideo: warming one would spend mobile data
             // fetching a second copy of a file the listener deliberately saved,
@@ -1444,6 +1484,7 @@ object AudioCache {
             // reverted track resolves through YouTube, which is what it warms.
             val pinnedToYouTube = OriginalVersion.isPinned(next)
             scope.launch {
+                if (hasLosslessReplay(next)) return@launch
                 // With substitution on, the *bytes* half above used to be
                 // switched off outright, and the paragraph explaining why is
                 // still correct as far as it goes: read-ahead resolving to
@@ -1479,7 +1520,7 @@ object AudioCache {
                 // Safe to fill for the same reason in both cases: either nothing
                 // outranks YouTube and read-ahead is the only writer, or a
                 // source has been pinned and every writer now resolves to it.
-                val cacheBytes = (!substitutable || warmed != null) && !pinnedToYouTube
+                val cacheBytes = warmed?.format?.isLossless == true && !pinnedToYouTube
                 if (cacheBytes) {
                     launch(TrackLog.about(next)) {
                         delay(PREFETCH_DELAY_MS)
@@ -1490,6 +1531,7 @@ object AudioCache {
                 launch {
                     delay(PREFETCH_DELAY_MS)
                     for (id in videoIds.take(QUEUE_LOOKAHEAD + 1).let { if (cacheBytes) it.drop(1) else it }) {
+                        if (hasLosslessReplay(id)) continue
                         // A track already pinned to another source has no use
                         // for a YouTube URL: nothing will ask for one, and
                         // minting it spends a client walk to fill a cache entry
@@ -1532,6 +1574,7 @@ object AudioCache {
             return
         }
         directJob = scope.launch(TrackLog.about(id)) {
+            if (hasLosslessReplay(id)) return@launch
             if (StreamChoice.of(id) == null) {
                 val addon = runCatching { DirectSourceGate.lookup(id, upcoming.target) }
                     .onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }

@@ -54,3 +54,19 @@ AGENTS.md
 
 # Keep Markdown documentation local at every directory level.
 *.[mM][dD]
+
+# Private deployment state and credentials (examples contain placeholders only).
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.pem
+*.key
+.cloudflared/
+.private/
+personal/private/
+personal/deploy/*.local
+personal

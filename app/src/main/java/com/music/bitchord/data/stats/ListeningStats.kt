@@ -129,6 +129,7 @@ object ListeningStats {
      * the same threshold the scrobbler uses.
      */
     fun record(song: Song, playedMs: Long, countsAsPlay: Boolean) {
+        if (countsAsPlay) com.music.bitchord.data.personal.PrivateSync.recordPlay(song)
         if (!ready) return
         if (playedMs <= 0 && !countsAsPlay) return
         if (song.videoId.isBlank()) return

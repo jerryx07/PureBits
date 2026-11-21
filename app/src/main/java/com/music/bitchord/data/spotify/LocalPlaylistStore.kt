@@ -72,6 +72,14 @@ object LocalPlaylistStore {
         return playlist
     }
 
+    /** Apply a private-library record without changing its cross-device identity. */
+    fun applySynced(playlist: LocalPlaylist) {
+        if (_playlists.value.firstOrNull { it.id == playlist.id } == playlist) return
+        val updated = _playlists.value.filterNot { it.id == playlist.id } + playlist
+        _playlists.value = updated
+        persist(updated)
+    }
+
     fun deletePlaylist(id: String) {
         val updated = _playlists.value.filterNot { it.id == id || it.browseId == id || it.id == id.removePrefix("local:playlist:") }
         _playlists.value = updated

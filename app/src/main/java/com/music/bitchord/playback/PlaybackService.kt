@@ -642,7 +642,7 @@ class PlaybackService : MediaLibraryService() {
     private val trackAnalyzer = com.music.bitchord.playback.smart.TrackAnalyzer(this, AudioCache)
 
     /** Shared with the crossfade's tail player, so both read the same disk cache. */
-    private var mediaSourceFactory: DefaultMediaSourceFactory? = null
+    private var mediaSourceFactory: androidx.media3.exoplayer.source.MediaSource.Factory? = null
 
     /** Last sampled position of the playing track, in seconds. */
     private var lastPositionSeconds = 0L
@@ -1240,6 +1240,10 @@ class PlaybackService : MediaLibraryService() {
             // line that can prove a "hi-res" session never quietly slid
             // onto a lower-rate stream mid-track. `adb logcat -s DECODE:I`.
             val measured = format.measure()
+            val decodedItem = eventTime.timeline.takeIf { eventTime.windowIndex in 0 until it.windowCount }
+                ?.getWindow(eventTime.windowIndex, Timeline.Window())?.mediaItem
+            AudioCache.noteDecodedFormat(decodedItem?.localConfiguration?.uri,
+                format.sampleMimeType, measured.bitDepth, measured.sampleRateHz)
             val khz = measured.sampleRateHz
                 ?.let { "%.1fkHz".format(Locale.ROOT, it / 1000.0) } ?: "?kHz"
             val kbps = format.bitrate.takeIf { it > 0 }
@@ -1842,11 +1846,15 @@ class PlaybackService : MediaLibraryService() {
         AudioCache.setUpstream(defaultDataSourceFactory)
         // DsdExtractorsFactory: the stock extractors plus DSF/DFF, which Media3
         // cannot open at all. A DSD file leaves the extractor as float PCM.
-        mediaSourceFactory = DefaultMediaSourceFactory(
+        val streamingMediaSourceFactory = DefaultMediaSourceFactory(
             MusicOnlyPlayback.holdingFactory(AudioCache.playbackFactory(defaultDataSourceFactory)),
             DsdExtractorsFactory(),
         )
             .setLoadErrorHandlingPolicy(PermanentAwareLoadErrorPolicy())
+        mediaSourceFactory = object : androidx.media3.exoplayer.source.MediaSource.Factory by streamingMediaSourceFactory {
+            override fun createMediaSource(mediaItem: MediaItem): androidx.media3.exoplayer.source.MediaSource =
+                streamingMediaSourceFactory.createMediaSource(AudioCache.forCachedPlayback(mediaItem))
+        }
 
         configuredFloatOutput = shouldEnableFloatOutput()
         val exoPlayer = buildPlayer(
@@ -3532,6 +3540,7 @@ class PlaybackService : MediaLibraryService() {
         refreshCustomLayouts()
         favoriteActionJob = scope.launch {
             YtMusicRepository.rate(videoId, target)
+                .onSuccess { com.music.bitchord.data.personal.PrivateSync.recordLike(videoId, target == LikeStatus.LIKE) }
                 .onFailure {
                     LikeState.set(videoId, previous)
                     refreshCustomLayouts()
@@ -3750,6 +3759,13 @@ class PlaybackService : MediaLibraryService() {
         // The entry this track is read from now counts as played — the only
         // kind the Cached songs folder lists. See [AudioCache.Origin].
         mediaItem?.let { AudioCache.notePlayed(it.toSong(), it.localConfiguration?.uri) }
+        if (alreadyAudible) {
+            exoPlayer.audioFormat?.let { format ->
+                val measured = format.measure()
+                AudioCache.noteDecodedFormat(mediaItem?.localConfiguration?.uri,
+                    format.sampleMimeType, measured.bitDepth, measured.sampleRateHz)
+            }
+        }
         scheduleForeignCachePurge()
         mediaItem?.mediaId?.let { id ->
             resolveLocalBitrate(id, mediaItem)
@@ -4675,6 +4691,11 @@ class PlaybackService : MediaLibraryService() {
         val item = player.currentMediaItem ?: return
         val mediaId = item.mediaId
         val uri = item.localConfiguration?.uri
+        if (uri != null && AudioCache.hasLosslessReplay(uri)) {
+            if (upgradeFor == mediaId) cancelStaleUpgradeJob()
+            NerdStats.onLosslessRaceEnd(mediaId)
+            return
+        }
         if (AddonSwitch.searchingMediaId.value == mediaId ||
             uri?.getQueryParameter(QualityUpgrade.MARKER)?.startsWith(AddonSwitch.PREFIX) == true
         ) return
@@ -4753,6 +4774,7 @@ class PlaybackService : MediaLibraryService() {
                 return@launch
             }
             val better = withContext(Dispatchers.IO) {
+                if (uri != null && AudioCache.hasLosslessReplay(uri)) return@withContext null
                 QualityUpgrade.lookAgain(mediaId, playingSeconds)
             } ?: return@launch
             try {
@@ -4788,7 +4810,8 @@ class PlaybackService : MediaLibraryService() {
         val mediaId = item.mediaId
         val marker = uri.getQueryParameter(QualityUpgrade.MARKER)
         val cachedOrigin = AudioCache.originOf(uri)
-        val currentSourceId = marker?.let { AddonSwitch.stream(mediaId, it)?.sourceConfigId }
+        val currentSourceId = AudioCache.sourceConfigIdOf(uri)?.takeIf { AudioCache.hasLosslessReplay(uri) }
+            ?: marker?.let { AddonSwitch.stream(mediaId, it)?.sourceConfigId }
             ?: QualityUpgrade.forcedStream(uri)?.sourceConfigId
             ?: StreamChoice.of(mediaId)?.sourceConfigId
             ?: AddonSwitch.sourceFor(mediaId)
@@ -4878,6 +4901,7 @@ class PlaybackService : MediaLibraryService() {
                         }).build()
                     QualityUpgrade.forget(mediaId)
                     QualityUpgrade.refuseUpgrades(mediaId)
+                    AudioCache.rejectCachedRecordings(mediaId)
                     OriginalVersion.unpin(mediaId)
                     AddonSwitch.recordSource(mediaId, stream.sourceConfigId)
                     StreamContainer.served(mediaId, stream.url)
@@ -6661,7 +6685,7 @@ class PlaybackService : MediaLibraryService() {
         cancelPrefetch()
         StreamChoice.forgetWhere(keep) { !permitted(it) }
         QualityUpgrade.onCeilingLowered(keep, permitted)
-        AudioCache.dropForeignEntries(keep, keepAnalysis = true)
+        AudioCache.dropForeignEntries(keep)
         prefetchAround(exoPlayer)
         lookForBetterCopy(exoPlayer)
     }

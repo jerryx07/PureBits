@@ -1498,6 +1498,14 @@ fun SettingsScreen(
         }
 
         if (shows(SettingsCategory.YOUR_DATA)) SearchableSettingsGroup(search, header = stringResource(R.string.your_data)) {
+            row("Private web sync", "web", "server", "sync", "personal") {
+                SettingsRow(
+                    icon = SfIcons.Wifi,
+                    title = "Private web sync",
+                    subtitle = "Your personal player and synchronized library",
+                    onClick = { context.startActivity(Intent(context, com.music.bitchord.ui.PrivateSyncActivity::class.java)) },
+                )
+            }
             val replayTitle = stringResource(R.string.replay)
             row(replayTitle, "stats", "history", "wrapped") {
                 SettingsRow(

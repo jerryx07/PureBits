@@ -98,7 +98,7 @@ object AppUpdateChecker {
     /**
      * Accept production Gradle filenames and PureBits-vVERSION[_ABI].apk names.
      * Exact names exclude debug, unsigned, TV and unrelated APKs.
-     * Prefer universal, then the device's ABIs in their supported order.
+     * Prefer the device's ABIs in their supported order, then universal.
      */
     internal fun apkAssetUrl(release: JsonObject, supportedAbis: List<String>): String? = runCatching {
         val tag = release["tag_name"]?.jsonPrimitive?.contentOrNull ?: return null
@@ -112,14 +112,14 @@ object AppUpdateChecker {
                 name.lowercase() to url
             }.orEmpty().toMap()
         val names = buildList {
-            add("app-prod-universal-release.apk")
-            add("PureBits-v$version.apk")
-            add("PureBits-$version.apk")
             for (abi in supportedAbis) {
                 add("app-prod-$abi-release.apk")
                 add("PureBits-v${version}_$abi.apk")
                 add("PureBits-${version}_$abi.apk")
             }
+            add("app-prod-universal-release.apk")
+            add("PureBits-v$version.apk")
+            add("PureBits-$version.apk")
         }
         names.firstNotNullOfOrNull { apks[it.lowercase()] }
     }.getOrNull()
