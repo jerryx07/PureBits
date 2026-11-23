@@ -20,8 +20,8 @@ import java.io.ByteArrayOutputStream
  * here is to emit a new block chain and copy the frames through untouched.
  *
  * What comes out is the magic, `STREAMINFO`, every other block the file already
- * had, then a fresh `VORBIS_COMMENT` and `PICTURE`. The old copies of those two
- * are dropped rather than added to — a second `VORBIS_COMMENT` is illegal, and
+ * had, then any new `VORBIS_COMMENT` and `PICTURE`. A block is replaced only
+ * when its replacement fits — a second `VORBIS_COMMENT` is illegal, and
  * two front covers is a coin toss over which one a player shows. `PADDING` is
  * dropped as well, which is what it is there for: it exists to be spent on
  * exactly this.
@@ -117,7 +117,7 @@ object FlacTagger {
             .filter { it.second.size <= MAX_BLOCK_BYTES }
         if (additions.isEmpty()) return null
 
-        val chain = blocks.filterNot { it.type in REPLACED }
+        val chain = blocks.filterNot { block -> block.type == TYPE_PADDING || additions.any { it.first == block.type } }
             .map { it.type to head.copyOfRange(it.start, it.start + it.length) } + additions
 
         val out = ByteArrayOutputStream(offset + additions.sumOf { it.second.size } + 64)
@@ -240,7 +240,6 @@ object FlacTagger {
     private const val TYPE_PICTURE = 6
 
     /** Blocks this rewrites or spends, rather than carrying across. */
-    private val REPLACED = setOf(TYPE_PADDING, TYPE_VORBIS_COMMENT, TYPE_PICTURE)
 
     /** The most a three-byte length field can describe. */
     private const val MAX_BLOCK_BYTES = (1 shl 24) - 1

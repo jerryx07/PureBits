@@ -3,6 +3,7 @@ package com.music.bitchord.download
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.music.bitchord.data.DebugLog as Log
 import com.music.bitchord.data.Http
@@ -159,12 +160,28 @@ object MediaTagger {
     }
 
     /** Fetch and persist a collection cover before its remote URL goes stale. */
-    internal fun cacheArtwork(context: Context, sourceUrl: String?): String? {
+    internal fun cacheArtwork(context: Context, sourceUrl: String?, allowNetwork: Boolean = true): String? {
         if (sourceUrl.isNullOrBlank()) return null
-        artworkFile(context, sourceUrl).takeIf { it.isFile }?.let { return Uri.fromFile(it).toString() }
+        artworkFile(context, sourceUrl).takeIf { it.length() > 0 }?.let { return Uri.fromFile(it).toString() }
+        if (!allowNetwork) return null
         val artwork = fetchCover(sourceUrl.artworkAt(1200) ?: sourceUrl, "collection") ?: return null
         return persistArtwork(context, sourceUrl, artwork)
     }
+
+    internal fun embeddedArtwork(context: Context, audio: Uri): String? = runCatching {
+        val reader = MediaMetadataRetriever()
+        val bytes = try {
+            reader.setDataSource(context, audio)
+            reader.embeddedPicture
+        } finally {
+            reader.release()
+        } ?: return null
+        persistArtwork(context, null, jpeg { bytes.inputStream() })
+    }.getOrNull()
+
+    internal fun cacheLocalArtwork(context: Context, uri: Uri): String? = runCatching {
+        persistArtwork(context, null, jpeg { context.contentResolver.openInputStream(uri) })
+    }.getOrNull()
 
     private fun cachedArtwork(context: Context, sourceUrl: String): Artwork? = runCatching {
         artworkFile(context, sourceUrl).takeIf { it.isFile }
@@ -414,14 +431,32 @@ object MediaTagger {
             val request = okhttp3.Request.Builder().url(url).build()
             Http.client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@runCatching null
-                val raw = response.body?.bytes() ?: return@runCatching null
-                val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: return@runCatching null
-                val scaled = downscale(bitmap, COVER_MAX_SIDE)
-                val out = ByteArrayOutputStream()
-                scaled.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                Artwork(out.toByteArray(), "image/jpeg")
+                val source = response.body?.source() ?: return@runCatching null
+                if (source.request(16L * 1024 * 1024 + 1)) return@runCatching null
+                val raw = source.readByteArray()
+                jpeg { raw.inputStream() }
             }
         }.onFailure { Log.d(TAG, "no cover saved for $logId: ${it.message}") }.getOrNull()
+    }
+
+    private fun jpeg(open: () -> InputStream?): Artwork? {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        open()?.use { BitmapFactory.decodeStream(it, null, options) }
+        if (options.outWidth <= 0 || options.outHeight <= 0) return null
+        options.inJustDecodeBounds = false
+        options.inSampleSize = 1
+        while (max(options.outWidth, options.outHeight) / options.inSampleSize > COVER_MAX_SIDE * 2) {
+            options.inSampleSize *= 2
+        }
+        val bitmap = open()?.use { BitmapFactory.decodeStream(it, null, options) } ?: return null
+        val scaled = downscale(bitmap, COVER_MAX_SIDE)
+        return try {
+            val out = ByteArrayOutputStream()
+            if (scaled.compress(Bitmap.CompressFormat.JPEG, 92, out)) Artwork(out.toByteArray(), "image/jpeg") else null
+        } finally {
+            if (scaled !== bitmap) scaled.recycle()
+            bitmap.recycle()
+        }
     }
 
     private fun downscale(bitmap: Bitmap, maxSide: Int): Bitmap {

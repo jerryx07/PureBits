@@ -24,8 +24,8 @@ import com.music.bitchord.data.remote.RemoteArtworkStore
 fun rememberRemoteArtworkUrl(song: Song?): String? {
     val context = LocalContext.current
     val key = song?.videoId
-    var resolved by remember(key) { mutableStateOf(song?.thumbnailUrl) }
-    LaunchedEffect(key) {
+    var resolved by remember(key, song?.thumbnailUrl) { mutableStateOf(song?.thumbnailUrl) }
+    LaunchedEffect(key, song?.thumbnailUrl) {
         if (song != null && song.thumbnailUrl == null &&
             (song.videoId.startsWith("webdav:") || song.videoId.startsWith("smb:"))
         ) {

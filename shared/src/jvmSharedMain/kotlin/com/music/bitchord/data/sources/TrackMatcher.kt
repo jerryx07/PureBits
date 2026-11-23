@@ -746,7 +746,8 @@ object TrackMatcher {
     internal fun artistNames(value: String): Set<List<String>> = normalize(value)
         .split(ARTIST_SEPARATORS)
         .map { name ->
-            name.split(WORD_SPLIT)
+            // The native and romanized credits for the artist on Mizukiri.
+            (if (name.trim() == "優里") "yuuri" else name).split(WORD_SPLIT)
                 .map { it.replace(NON_ALNUM, "") }
                 .filter { it.length > 1 }
         }

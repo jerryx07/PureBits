@@ -64,8 +64,7 @@ object LocalMediaRepository {
     }
 
     /**
-     * Retrieves all songs in the `Music/BitChord` directory, combining app downloads
-     * with any local audio files present in that folder.
+     * Combines recorded downloads with verified FLAC files in Music/PureBits.
      *
      * The download record is the better source for a title and a credit — it
      * holds what the catalogue row said, not what a scanner guessed off a
@@ -75,8 +74,7 @@ object LocalMediaRepository {
      * gaps, which is what keeps the Albums tab from being empty for everything
      * downloaded before that field existed.
      */
-    suspend fun getDownloadedSongs(context: Context): List<Song> = withContext(Dispatchers.IO) {
-        val appDownloads = Downloads.getDownloadedSongs(context)
+    internal suspend fun scanDownloadFolder(context: Context, appDownloads: List<Song>): List<Song> = withContext(Dispatchers.IO) {
         val knownUris = appDownloads.mapNotNull { it.localUri }.toSet()
         val extraSongs = mutableListOf<Song>()
 
@@ -89,13 +87,16 @@ object LocalMediaRepository {
                     MediaStore.Audio.Media._ID,
                     MediaStore.Audio.Media.DISPLAY_NAME,
                     MediaStore.Audio.Media.RELATIVE_PATH,
+                    MediaStore.MediaColumns.VOLUME_NAME,
                     MediaStore.Audio.Media.ALBUM,
                     MediaStore.Audio.Media.ALBUM_ID,
                     MediaStore.Audio.Media.DATE_ADDED,
                     MediaStore.Audio.Media.DATE_MODIFIED,
                 )
-                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-                val selectionArgs = arrayOf("%${DownloadStore.FOLDER}%")
+                val folder = "Music/${DownloadStore.FOLDER}"
+                val selection = "${MediaStore.MediaColumns.RELATIVE_PATH} IN (?, ?) AND " +
+                    "${MediaStore.MediaColumns.IS_PENDING} = 0 AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+                val selectionArgs = arrayOf(folder, "$folder/", "%.flac")
 
                 context.contentResolver.query(
                     MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
@@ -106,6 +107,7 @@ object LocalMediaRepository {
                 )?.use { cursor ->
                     val idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
                     val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+                    val volumeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.VOLUME_NAME)
                     val albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
                     val albumIdCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
                     val dateAddedCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
@@ -116,6 +118,10 @@ object LocalMediaRepository {
                         val id = cursor.getLong(idCol)
                         val name = cursor.getString(nameCol) ?: continue
                         val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id).toString()
+                        // insert() can return a volume-specific URI for the same row in the external collection.
+                        val volumeUri = cursor.getString(volumeCol)?.let { volume ->
+                            ContentUris.withAppendedId(MediaStore.Audio.Media.getContentUri(volume), id).toString()
+                        }
                         val albumId = cursor.getLong(albumIdCol)
                         val tags = ScannedTags(
                             albumName = cursor.getString(albumCol).cleanTag(),
@@ -128,8 +134,9 @@ object LocalMediaRepository {
                             dateModifiedSeconds = cursor.getLong(dateModifiedCol),
                         )
                         scanned[contentUri] = tags
-                        if (contentUri !in knownUris && isAudioFileName(name)) {
-                            extraSongs.add(buildSongFromUri(context, contentUri, name, tags))
+                        if (volumeUri != null) scanned[volumeUri] = tags
+                        if (contentUri !in knownUris && volumeUri !in knownUris && DownloadStore.isFlac(context, Uri.parse(contentUri))) {
+                            extraSongs.add(buildSongFromUri(context, contentUri, name, tags).copy(downloadFormat = "FLAC"))
                         }
                     }
                 }
@@ -142,9 +149,9 @@ object LocalMediaRepository {
                 )
                 if (folder.exists() && folder.isDirectory) {
                     folder.listFiles()?.forEach { file ->
-                        if (file.isFile && isAudioFileName(file.name)) {
+                        if (file.isFile && file.extension.equals("flac", true)) {
                             val uriStr = Uri.fromFile(file).toString()
-                            if (uriStr !in knownUris) {
+                            if (uriStr !in knownUris && DownloadStore.isFlac(context, Uri.fromFile(file))) {
                                 val modified = file.lastModified().takeIf { it > 0 }?.div(1_000)
                                 extraSongs.add(
                                     buildSongFromUri(
@@ -152,14 +159,14 @@ object LocalMediaRepository {
                                         uriStr,
                                         file.name,
                                         ScannedTags(null, null, modified, modified),
-                                    ),
+                                    ).copy(downloadFormat = "FLAC"),
                                 )
                             }
                         }
                     }
                 }
             }
-        }.onFailure { Log.w(TAG, "Failed scanning Music/BitChord directory: ${it.message}") }
+        }.onFailure { Log.w(TAG, "Failed scanning Music/PureBits directory: ${it.message}") }
 
         val filled = appDownloads.map { song ->
             val uri = song.localUri ?: return@map song
@@ -525,8 +532,10 @@ object LocalMediaRepository {
         fileName: String,
         scanned: ScannedTags? = null,
     ): Song {
-        var title = fileName.substringBeforeLast(".")
-        var artist = "Unknown Artist"
+        val stem = fileName.substringBeforeLast(".")
+        val appFilename = scanned != null && stem.contains(" - ")
+        var title = if (appFilename) stem.substringAfter(" - ") else stem
+        var artist = if (appFilename) stem.substringBefore(" - ") else "Unknown Artist"
         var albumName: String? = null
         var durationText: String? = null
         var trackNumber: Int? = null
@@ -541,8 +550,8 @@ object LocalMediaRepository {
                 val metaDur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
                 val metaTrack = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER)
 
-                if (!metaTitle.isNullOrBlank()) title = metaTitle
-                if (!metaArtist.isNullOrBlank()) artist = metaArtist
+                metaTitle.cleanTag()?.let { title = it }
+                metaArtist.cleanTag()?.let { artist = it }
                 albumName = metaAlbum.cleanTag()
                 if (metaDur != null && metaDur > 0) durationText = formatDuration(metaDur)
                 trackNumber = trackNumberFromTag(metaTrack)

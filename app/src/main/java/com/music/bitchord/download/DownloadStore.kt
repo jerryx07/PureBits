@@ -175,6 +175,10 @@ object DownloadStore {
         }
     }.onFailure { Log.w(TAG, "media store lookup failed for $name: ${it.message}") }.getOrNull()
 
+    internal fun isFlac(context: Context, uri: Uri): Boolean = runCatching {
+        context.contentResolver.openInputStream(uri)?.use(DownloadedFlac::hasHeader) == true
+    }.getOrDefault(false)
+
     /**
      * Whether [uri] still names a file that is there.
      *

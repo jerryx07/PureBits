@@ -731,6 +731,7 @@ object SourceResolver {
         keep: suspend (SourceStream) -> SourceStream? = { it },
         budgetMs: Long? = null,
         sources: List<MusicSource>? = null,
+        onlyFlac: Boolean = false,
     ): SourceStream? = coroutineScope {
         val until = budgetMs?.let { System.nanoTime() + it * 1_000_000 }
         if (target.title.isBlank()) return@coroutineScope null
@@ -757,7 +758,7 @@ object SourceResolver {
         // an absent YouTube means everything enabled outranks it, which is
         // already what [rankedAbove] says about a config that isn't in the list.
         val youtubeId = active.firstOrNull { it.kind == SourceKind.YOUTUBE }?.configId
-        val ranked = rankedAbove(youtubeId.orEmpty(), active)
+        val ranked = if (onlyFlac) active.filter { it.kind.canServeLossless } else rankedAbove(youtubeId.orEmpty(), active)
         val strictLength = target.durationSec != null
 
         // Who is in the bit-exact walk, and who is left to the race below it.
@@ -767,7 +768,7 @@ object SourceResolver {
         // alone. That is what puts JioSaavn's 320 in front of YouTube's AAC for
         // a setting whose own description is "best AAC on offer".
         val bitExact = if (wantsLossless) ranked.filter { it.kind.canServeLossless } else emptyList()
-        val elsewhere = ranked - bitExact.toSet()
+        val elsewhere = if (onlyFlac) emptyList() else ranked - bitExact.toSet()
 
         // Asked now, read at the end — and raced rather than walked, because
         // these differ in speed by two orders of magnitude and the whole lookup
@@ -826,7 +827,7 @@ object SourceResolver {
                     waitForAll = true,
                     strictLength = strictLength,
                     requireSharedArtist = true,
-                )?.let { keep(it) }
+                )?.let { keep(it) }?.takeIf { !onlyFlac || it.format.codec.equals("flac", true) }
             }
         }
 

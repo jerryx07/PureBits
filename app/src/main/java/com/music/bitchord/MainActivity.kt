@@ -1051,6 +1051,10 @@ private fun BitChordApp(
     val downloadIdFor: (String?) -> String? = { id ->
         id?.let { Downloads.recordIdOf(it) ?: it }?.takeIf { it in savedCollections }
     }
+    val downloadRows = (topDetail?.takeIf { it.browseId == "local:downloads" }?.songs as? UiState.Success)?.data.orEmpty()
+    LaunchedEffect(remember(downloadRows) { downloadRows.map { it.localUri } }) {
+        viewModel.recoverDownloadArtwork(downloadRows)
+    }
     LaunchedEffect(savedDownloads, savedCollections, topDetail?.browseId) {
         val openPage = topDetail ?: return@LaunchedEffect
         val open = openPage.browseId
@@ -2492,12 +2496,24 @@ private fun BitChordApp(
         linksLoading = false
         if (!playerShowing) return@LaunchedEffect
         val current = player.song ?: return@LaunchedEffect
+        if (current.videoId.startsWith("content://") || current.videoId.startsWith("file://")) return@LaunchedEffect
         if (current.albumId != null && current.artistId != null) return@LaunchedEffect
         linksLoading = true
         links = YtMusicRepository.trackLinks(current.videoId).getOrNull()
         linksLoading = false
     }
-    val playerSong = player.song?.let { current ->
+    val playingTrack = player.song
+    var localCover by remember(playingTrack?.videoId, playingTrack?.localUri, playingTrack?.thumbnailUrl) {
+        mutableStateOf<String?>(null)
+    }
+    LaunchedEffect(playingTrack?.videoId, playingTrack?.localUri, playingTrack?.thumbnailUrl) {
+        val uri = playingTrack?.localUri ?: return@LaunchedEffect
+        if (uri.startsWith("file://") || uri.startsWith("content://")) {
+            localCover = viewModel.downloadArtwork(playingTrack)
+        }
+    }
+    val playerSong = playingTrack?.let { track ->
+        val current = localCover?.takeIf { it != track.thumbnailUrl }?.let { track.copy(thumbnailUrl = it) } ?: track
         val extra = links?.takeIf { it.videoId == current.videoId } ?: return@let current
         current.copy(
             artistId = current.artistId ?: extra.artistId,
@@ -4183,7 +4199,7 @@ private fun BitChordApp(
                         selectedIndex = selectedTab,
                         onTabSelected = onTabSelected,
                         scrollConnection = navBarScroll,
-                        song = player.song,
+                        song = playerSong,
                         isPlaying = player.isPlaying,
                         isLoading = playPauseBusy,
                         onPlayPause = {
@@ -4217,7 +4233,7 @@ private fun BitChordApp(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     QueueActionNoticeHost(queueNotice)
-                    player.song?.let { song ->
+                    playerSong?.let { song ->
                         MiniPlayer(
                             song = song,
                             isPlaying = player.isPlaying,

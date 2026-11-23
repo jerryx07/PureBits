@@ -58,6 +58,17 @@ class DownloadRecordingMatchTest {
         assertTrue(source.opened.isEmpty())
     }
 
+    @Test fun flacOnlySkipsAacAndAlacAndFailsWithoutAFlacSource() = runBlocking {
+        val target = TrackMatcher.targetOf(song())
+        val aac = Catalogue("aac", song(), StreamFormat("mp4", kbps = 320))
+        val alac = Catalogue("alac", song(), StreamFormat("alac"))
+        val flac = Catalogue("flac", song(), StreamFormat("flac"))
+        assertNull(SourceResolver.forDownload(target, StreamRequest.Lossless,
+            sources = listOf(aac, alac), onlyFlac = true))
+        assertEquals("flac", SourceResolver.forDownload(target, StreamRequest.Lossless,
+            sources = listOf(aac, alac, flac), onlyFlac = true)?.sourceConfigId)
+    }
+
     @Test fun languageVersionsWithIdenticalCreditsAndDurationStayDistinct() {
         val japanese = TrackMatcher.targetOf(song("Shinunoga E-Wa (Japanese Version)"))
         assertFalse(TrackMatcher.matches(song("Shinunoga E-Wa (English Version)"), japanese.title, japanese.artist, 185))

@@ -1355,4 +1355,5 @@
     <string name="bit_perfect_unavailable_permission">USB permission is needed. Select Direct USB and approve the system prompt.</string>
     <string name="bit_perfect_unavailable_format">No compatible exclusive format is available for this track. Choose another output to continue.</string>
     <string name="bit_perfect_unavailable_exclusive">Android refused true AAudio exclusive playback on the wired output.</string>
+    <string name="download_flac_only">Only saves recordings available in FLAC.</string>
 </resources>

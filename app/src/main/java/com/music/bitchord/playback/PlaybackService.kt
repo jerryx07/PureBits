@@ -4414,7 +4414,7 @@ class PlaybackService : MediaLibraryService() {
         if (scheme != "file" && scheme != "content") return false
         val mediaId = item.mediaId
 
-        Downloads.forgetMissing(mediaId)
+        Downloads.forgetMissingUri(uri.toString())
         val restreamed = item.toSong().copy(localUri = null, localPath = null).toMediaItem()
         if (restreamed.localConfiguration?.uri == uri) {
             TrackLog.w(
@@ -6710,6 +6710,7 @@ class PlaybackService : MediaLibraryService() {
             // byte warmed for it now would be wasted.
             (nextIndex..end).map(player::getMediaItemAt)
                 .filterNot(MusicOnlyPlayback::wants)
+                .filter { it.localConfiguration?.uri?.scheme == "bitchord" }
                 .map { it.toSong() }
         } else {
             emptyList()
@@ -6933,6 +6934,7 @@ class PlaybackService : MediaLibraryService() {
         if (nextIndex == C.INDEX_UNSET) return
         val next = exoPlayer.getMediaItemAt(nextIndex)
         if (MusicOnlyPlayback.wants(next)) return
+        if (next.localConfiguration?.uri?.scheme != "bitchord") return
         val duration = exoPlayer.duration
         if (duration == C.TIME_UNSET || duration <= 0L) return
         val boundary = crossfade?.plannedTransitionFor(current.mediaId) ?: duration

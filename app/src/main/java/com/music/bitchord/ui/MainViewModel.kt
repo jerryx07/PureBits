@@ -3008,6 +3008,31 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun knownArtworkSongs(): List<Song> =
+        (_history.value as? UiState.Success)?.data.orEmpty() +
+            (_library.value as? UiState.Success)?.data?.likedSongs.orEmpty()
+
+    suspend fun downloadArtwork(song: Song): String? =
+        Downloads.resolveArtwork(getApplication(), song, knownArtworkSongs())
+
+    /** Fill covers after the Downloads list is visible. Leaving the page cancels the pass. */
+    suspend fun recoverDownloadArtwork(songs: List<Song>) {
+        val known = knownArtworkSongs()
+        for (song in songs) {
+            val art = Downloads.resolveArtwork(getApplication(), song, known) ?: continue
+            if (art == song.thumbnailUrl) continue
+            _detailStack.update { pages ->
+                pages.map { page ->
+                    val rows = (page.songs as? UiState.Success)?.data
+                    if (page.browseId != "local:downloads" || rows == null) page
+                    else page.copy(songs = UiState.Success(rows.map {
+                        if (it.localUri == song.localUri && it.thumbnailUrl == song.thumbnailUrl) it.copy(thumbnailUrl = art) else it
+                    }))
+                }
+            }
+        }
+    }
+
     /**
      * The listing behind a page whose tracks come from this device or a file
      * server rather than YouTube — a device folder, a release downloaded whole,
@@ -3048,7 +3073,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             Downloads.recordIdOf(browseId) != null ->
                 nonEmpty(downloadedPlaylist(browseId)) { text(R.string.downloaded_playlist_empty) }
             browseId == "local:downloads" ->
-                nonEmpty(Downloads.getDownloadedSongs(context)) { "No downloaded tracks" }
+                nonEmpty(Downloads.getDownloadedSongs(context)) {
+                    if (LocalMediaRepository.hasStoragePermission(context)) "No downloaded tracks"
+                    else text(R.string.storage_required_read)
+                }
             browseId == CACHE_FOLDER_BROWSE_ID -> cachedSongsState()
             browseId == "local:all" -> if (!LocalMediaRepository.hasStoragePermission(context)) {
                 UiState.Error(text(R.string.storage_required_read))

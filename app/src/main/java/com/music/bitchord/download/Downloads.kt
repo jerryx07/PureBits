@@ -7,7 +7,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import com.music.bitchord.data.DebugLog as Log
 import androidx.core.content.ContextCompat
-import com.music.bitchord.data.innertube.StreamResolver
+import com.music.bitchord.data.LocalMediaRepository
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.settings.AppSettings
@@ -31,6 +31,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -116,6 +118,7 @@ object Downloads {
     val saved: StateFlow<Map<String, String>> = _saved.asStateFlow()
 
     private val _savedMetadata = MutableStateFlow<Map<String, SavedSongMetadata>>(emptyMap())
+    @Volatile private var flacIndex = DownloadedFlac.Index(emptyList())
 
     private val _collections = MutableStateFlow<Map<String, SavedCollection>>(emptyMap())
 
@@ -160,6 +163,10 @@ object Downloads {
         _collections.value = runCatching {
             json.decodeFromString(collectionSerializer, prefs.getString(KEY_SAVED_COLLECTIONS, null) ?: "{}")
         }.getOrDefault(emptyMap())
+        flacIndex = DownloadedFlac.Index(_savedMetadata.value.values)
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            if (LocalMediaRepository.hasStoragePermission(context)) getDownloadedSongs(context.applicationContext)
+        }
     }
 
     // ---- Asking -------------------------------------------------------------
@@ -402,6 +409,43 @@ object Downloads {
         forget(videoId)
         return null
     }
+
+    fun playbackUri(song: Song): String? {
+        val exact = verifiedSavedUri(song.videoId)
+        if (exact != null && _savedMetadata.value[song.videoId]?.verifiedFlac == true) return exact
+        val match = flacIndex.match(song)
+        return match?.let { verifiedSavedUri(it.videoId) } ?: exact
+    }
+
+    internal fun forgetMissingUri(uri: String) {
+        _saved.value.filterValues { it == uri }.keys.forEach(::forget)
+    }
+
+    private val artworkRecovery = Mutex()
+
+    internal suspend fun resolveArtwork(context: Context, song: Song, knownSongs: List<Song>): String? =
+        withContext(Dispatchers.IO) {
+            val uri = song.localUri ?: return@withContext null
+            // The player and Downloads can request the same cover at once. Re-read the
+            // record under the lock so the second caller immediately gets the local image.
+            artworkRecovery.withLock {
+                val records = _savedMetadata.value
+                val savedTrack = records[song.videoId]?.takeIf { it.uri == uri } ?: records[uri]
+                    ?: records.values.firstOrNull { it.uri == uri }
+                val savedCover = savedTrack?.thumbnailUrl
+                if (savedCover?.startsWith("file://") == true &&
+                    Uri.parse(savedCover).path?.let { File(it).length() > 0 } == true) return@withLock savedCover
+                val cover = DownloadArtwork.recover(context, song, knownSongs) ?: return@withLock null
+                if (savedTrack != null && savedCover != cover) {
+                    record(saved = { it }, meta = { current ->
+                        current.mapValues { (_, metadata) ->
+                            if (metadata.uri == uri) metadata.copy(thumbnailUrl = cover) else metadata
+                        }
+                    })
+                }
+                cover
+            }
+        }
 
     /** Delete the file saved for [videoId] and forget it. */
     suspend fun delete(context: Context, videoId: String): Boolean = withContext(Dispatchers.IO) {
@@ -679,13 +723,6 @@ object Downloads {
         val existingAdded = ids.firstNotNullOfOrNull { _savedMetadata.value[it]?.dateAddedSeconds }
         val dateAddedSeconds = resolvedDownloadDates(existingAdded, fileModifiedMillis).first
             ?: System.currentTimeMillis() / 1_000
-        // HLS packages cannot carry MP4 tags. Point the app's own metadata at
-        // the cover saved beside their playlist so Downloads remains fully
-        // offline even though another player cannot open that package.
-        val savedArtwork = uri.takeIf { it.scheme == "file" && it.lastPathSegment == "playlist.m3u8" }
-            ?.path?.let(::File)?.parentFile
-            ?.listFiles()?.firstOrNull { it.nameWithoutExtension == "cover" }
-            ?.let(Uri::fromFile)?.toString()
         // Either row may be the one that knew the release: a music video is
         // swapped for the catalogue track before this, and it is the catalogue
         // row that usually carries the album — but a search hit tapped directly
@@ -694,9 +731,10 @@ object Downloads {
             ?: asked.albumName?.takeIf { it.isNotBlank() }
         val metaAsked = SavedSongMetadata(
             videoId = asked.videoId,
+            verifiedFlac = true,
             title = asked.title,
             artist = asked.artist,
-            thumbnailUrl = savedArtwork ?: artworkUri ?: asked.thumbnailUrl,
+            thumbnailUrl = artworkUri ?: asked.thumbnailUrl,
             durationText = asked.durationText,
             albumName = album,
             uri = uri.toString(),
@@ -705,9 +743,10 @@ object Downloads {
         )
         val metaFetched = SavedSongMetadata(
             videoId = fetched.videoId,
+            verifiedFlac = true,
             title = fetched.title,
             artist = fetched.artist,
-            thumbnailUrl = savedArtwork ?: artworkUri ?: fetched.thumbnailUrl,
+            thumbnailUrl = artworkUri ?: fetched.thumbnailUrl,
             durationText = fetched.durationText,
             albumName = album,
             uri = uri.toString(),
@@ -737,10 +776,11 @@ object Downloads {
         saved: (Map<String, String>) -> Map<String, String>,
         meta: (Map<String, SavedSongMetadata>) -> Map<String, SavedSongMetadata>,
     ) {
-        val savedMap = _saved.updateAndGet(saved)
-        val metaMap = _savedMetadata.updateAndGet(meta)
-        if (!::prefs.isInitialized) return
         synchronized(recordLock) {
+            val savedMap = _saved.updateAndGet(saved)
+            val metaMap = _savedMetadata.updateAndGet(meta)
+            flacIndex = DownloadedFlac.Index(metaMap.values)
+            if (!::prefs.isInitialized) return
             prefs.edit()
                 .putString(KEY_SAVED, json.encodeToString(serializer, savedMap))
                 .putString(KEY_SAVED_METADATA, json.encodeToString(metadataSerializer, metaMap))
@@ -757,6 +797,7 @@ object Downloads {
         val seenUris = mutableSetOf<String>()
         val migratedAddedByUri = mutableMapOf<String, Long>()
         val migratedFormatByUri = mutableMapOf<String, String>()
+        val verifiedUris = mutableSetOf<String>()
 
         for ((_, meta) in metaMap) {
             // A downloaded music video and the catalogue track it resolved to
@@ -765,6 +806,7 @@ object Downloads {
             if (!seenUris.add(meta.uri)) continue
             val uri = meta.uri.toUri()
             if (DownloadStore.exists(context, uri)) {
+                if (!meta.verifiedFlac && DownloadStore.isFlac(context, uri)) verifiedUris += meta.uri
                 val fileModifiedMillis = uri.takeIf { it.scheme == "file" }
                     ?.path
                     ?.let(::File)
@@ -802,12 +844,13 @@ object Downloads {
                 metaMap.filterValues { it.uri == meta.uri }.keys.forEach(::forget)
             }
         }
-        if (migratedAddedByUri.isNotEmpty() || migratedFormatByUri.isNotEmpty()) {
+        if (migratedAddedByUri.isNotEmpty() || migratedFormatByUri.isNotEmpty() || verifiedUris.isNotEmpty()) {
             record(
                 saved = { it },
                 meta = { current ->
                     current.mapValues { (_, saved) ->
                         saved.copy(
+                            verifiedFlac = saved.verifiedFlac || saved.uri in verifiedUris,
                             dateAddedSeconds = saved.dateAddedSeconds
                                 ?: migratedAddedByUri[saved.uri],
                             downloadFormat = saved.downloadFormat
@@ -817,7 +860,16 @@ object Downloads {
                 },
             )
         }
-        result
+        val scanned = LocalMediaRepository.scanDownloadFolder(context, result)
+        val recovered = scanned.filter { it.videoId == it.localUri && it.videoId !in metaMap && it.downloadFormat == "FLAC" }
+            .associate { song -> song.videoId to SavedSongMetadata(videoId = song.videoId, title = song.title,
+                artist = song.artist, durationText = song.durationText, albumName = song.albumName,
+                thumbnailUrl = song.thumbnailUrl, uri = song.videoId, dateAddedSeconds = song.localDateAddedSeconds,
+                downloadFormat = "FLAC", verifiedFlac = true) }
+        if (recovered.isNotEmpty()) {
+            record(saved = { it + recovered.mapValues { entry -> entry.value.uri } }, meta = { it + recovered })
+        }
+        scanned
     }
 
     /**
@@ -1004,31 +1056,11 @@ object Downloads {
         // matching is a manual playback action and must not silently change a
         // download or its filename.
         val track = song
-        // Read once, here, for the whole of this track. Both routes below
-        // and the re-resolve inside [Downloader.fetchResumable] have to agree on
-        // which rung they are fetching, and re-reading the setting per call
-        // would let a change made mid-download splice two renditions into
-        // one file.
-        val quality = AppSettings.downloadQuality.value
-
-        // Asked before the lookup rather than after it, unlike the check on the
-        // route's own filename below. A file already sitting in Music under a
-        // lossless extension is the answer to the whole question, and spending
-        // a twenty-second module search to arrive at a name we could have
-        // guessed is the difference between re-running a 300-track queue in
-        // seconds and re-running it in hours. Only the extensions that can only
-        // be lossless are worth guessing at: an `.m4a` may be this app's ALAC
-        // or its AAC, and adopting the wrong one would quietly answer a request
-        // for lossless with a transcode.
-        //
-        // Asked on every rung, not just Lossless: High keeps an addon's FLAC
-        // when nothing lossy beats YouTube (see [SourceResolver.forDownload]),
-        // and a FLAC already on disk is the song whatever the setting.
-        LOSSLESS_EXTENSIONS.firstNotNullOfOrNull { extension ->
-            DownloadStore.existing(context, DownloadStore.fileNameFor(track, extension))
-        }?.let { uri ->
-            return@withContext Prepared(song.videoId, track, route = null, alreadyAt = uri)
-        }
+        val quality = DownloadQuality.LOSSLESS
+        DownloadStore.existing(context, DownloadStore.fileNameFor(track, "flac"))
+            ?.takeIf { DownloadStore.isFlac(context, it) }?.let { uri ->
+                return@withContext Prepared(song.videoId, track, route = null, alreadyAt = uri)
+            }
 
         // Asked for from the Cached songs folder: the copy already on disk is
         // the answer, if it is whole. See [fromCache].
@@ -1086,7 +1118,7 @@ object Downloads {
         // rather than writing a second copy beside it.
         plan.alreadyAt?.let { uri ->
             DownloadParts.clear(context, id)
-            remember(song, track, uri)
+            remember(song, track, uri, "FLAC")
             DownloadSession.done(id)
             clear(id)
             return
@@ -1111,57 +1143,19 @@ object Downloads {
                 // cancellation, and that contract is load-bearing here: this is a
                 // plain child of the scope, so a failure inside it would cancel the
                 // download it was only meant to decorate.
-                // HLS has no tag container, but its private offline package has
-                // sidecars for exactly the same lyrics and full-resolution cover.
-                if (route.taggable && (route.offlineHls != null || MediaTagger.carriesTags(route.extension))) {
+                if (MediaTagger.carriesTags(route.extension)) {
                     lyrics = async { LyricsTag.forTrack(track) }
                     artwork = async { MediaTagger.artworkFor(context, track) }
                 }
 
                 val name = DownloadStore.fileNameFor(track, route.extension)
                 val alreadyThere = DownloadStore.existing(context, name)
-                if (alreadyThere != null) {
+                if (alreadyThere != null && DownloadStore.isFlac(context, alreadyThere)) {
                     DownloadParts.clear(context, id)
                     Log.d(TAG, "$name is already in Music; adopting it")
-                    remember(song, track, alreadyThere)
+                    remember(song, track, alreadyThere, "FLAC")
                     DownloadSession.done(id)
                     clear(id)
-                    return@coroutineScope
-                }
-
-                val manifest = route.offlineHls
-                if (manifest != null) {
-                    val onSegment: (Long, Long) -> Unit = { written, total ->
-                        val fraction = written.toFloat() / total
-                        _active.update { it + (id to DownloadState.Running(fraction)) }
-                        DownloadSession.running(id, fraction)
-                    }
-                    val savedUri = if (manifest.dash) {
-                        OfflineDash.save(
-                            context = context,
-                            id = id,
-                            url = manifest.url,
-                            headers = manifest.headers,
-                            onProgress = onSegment,
-                            lyrics = lyrics?.await(),
-                            artwork = artwork?.await(),
-                        )
-                    } else {
-                        OfflineHls.save(
-                            context = context,
-                            id = id,
-                            url = manifest.url,
-                            headers = manifest.headers,
-                            onProgress = onSegment,
-                            lyrics = lyrics?.await(),
-                            artwork = artwork?.await(),
-                        )
-                    }
-                    remember(song, track, savedUri, route.downloadFormat)
-                    DownloadParts.clear(context, id)
-                    DownloadSession.done(id)
-                    clear(id)
-                    Log.d(TAG, "saved offline ${if (manifest.dash) "DASH" else "HLS"} package for $name")
                     return@coroutineScope
                 }
 
@@ -1173,6 +1167,10 @@ object Downloads {
                         _active.update { it + (id to DownloadState.Running(fraction)) }
                         DownloadSession.running(id, fraction)
                     }
+                }
+                if (!DownloadStore.isFlac(context, destination.tagUri)) {
+                    DownloadParts.clear(context, id)
+                    error("The source returned a different format. Only FLAC downloads are allowed.")
                 }
                 val words = lyrics?.await()
                 val cover = artwork?.await()
@@ -1219,68 +1217,27 @@ object Downloads {
         val describe: String,
         /** Short premium-rendition badge shown only in BitChord's Downloads list. */
         val downloadFormat: String? = null,
-        val taggable: Boolean = true,
-        val offlineHls: Manifest? = null,
         val write: suspend (File, OutputStream, (written: Long, total: Long) -> Unit) -> Unit,
     )
 
-    /**
-     * A stream that arrived as an index rather than as audio, and which of the
-     * two index formats it is. Both are saved into the same offline package —
-     * see [OfflineDash] — so [dash] only decides who does the parsing.
-     */
-    internal class Manifest(
-        val url: String,
-        val headers: Map<String, String>,
-        val dash: Boolean = false,
-    )
-
-    /**
-     * Where this download's bytes are coming from.
-     *
-     * A row picked from a source — the Addons search, or anything queued from
-     * one — is fetched from that source first, as the row it is. Everything
-     * else, and a row whose source has nothing, is matched by title across the
-     * configured sources, and YouTube is what happens when none of them can
-     * serve it — see [SourceResolver.forDownload] for what "can" means, which
-     * is narrower here than it is for playback.
-     *
-     * Never YouTube for a source row, though. Its id is not a video id, so the
-     * resolve could only fail — and before this, that failure was what saved
-     * the playback cache's copy in its place, whatever that happened to be.
-     *
-     * @param quality read once by the caller and passed down, so that a setting
-     *   changed while this track is in the queue applies to the next one rather
-     *   than to the middle of this one. [Downloader.fetchResumable] resolves again after
-     *   a mid-download refusal and has to ask for the same rung it started on.
-     */
     private suspend fun routeFor(context: Context, track: Song, quality: DownloadQuality): Route {
         val row = SourceRegistry.parseTrackKey(track.videoId)
-        row?.let { (configId, trackId) ->
-            fromRow(track, configId, trackId, quality)?.let { kept ->
-                sourceRoute(context, track, kept)?.let { return it }
-            }
-        }
-        fromSources(track, quality)?.let { kept ->
-            sourceRoute(context, track, kept)?.let { return it }
-        }
-        if (row != null) {
-            val name = SourceRegistry.config(row.first)?.displayName ?: "its source"
-            error("Couldn't download this song from $name — check that it's still connected")
-        }
-        // MediaStore.Audio refuses audio/webm on affected Android versions.
-        // Keep Opus for app-private downloads, but pin exported downloads to
-        // AAC-in-MP4 for both the initial resolve and any mid-transfer retry.
-        val requireM4a = AppSettings.exportDownloads.value
-        val stream = StreamResolver.resolveForDownload(track.videoId, quality.maxKbps, requireM4a)
+        val kept = row?.let { (configId, trackId) -> fromRow(track, configId, trackId, quality) }
+            ?: fromSources(track, quality)
+            ?: error("No FLAC recording was available from your download sources.")
+        val stream = kept.stream
         return Route(
-            extension = stream.downloadExtension,
-            mimeType = stream.downloadMimeType,
-            describe = "${stream.kbps}kbps ${stream.mimeType}",
-            downloadFormat = youtubeDownloadBadge(stream.downloadExtension, stream.kbps),
-            write = { parts, sink, onProgress ->
-                Downloader.fetchResumable(track.videoId, stream, quality.maxKbps, requireM4a, File(parts, "audio.part"), onProgress)
-                    .inputStream().use { input -> input.copyTo(sink) }
+            extension = "flac",
+            mimeType = "audio/flac",
+            describe = stream.format.summary,
+            downloadFormat = stream.format.downloadBadge() ?: "FLAC",
+            write = { parts, sink, progress ->
+                when (val probe = kept.probe) {
+                    is Downloader.Probe.File -> ResumableTransfer.download(Http.client, stream.url, stream.headers,
+                        File(parts, "audio.part"), progress).inputStream().use { it.copyTo(sink) }
+                    is Downloader.Probe.Manifest -> ManifestFile.write(context.cacheDir, stream.url, stream.headers,
+                        probe.dash, "flac", sink, progress, File(parts, "segments"))
+                }
             },
         )
     }
@@ -1295,108 +1252,18 @@ object Downloads {
      */
     private class Kept(val stream: SourceStream, val probe: Downloader.Probe)
 
-    /** How to write [kept], or null when it can't be filed where downloads go. */
-    private fun sourceRoute(context: Context, track: Song, kept: Kept): Route? {
-        val stream = kept.stream
-        return when (val probe = kept.probe) {
-            is Downloader.Probe.File -> Route(
-                extension = probe.container.extension,
-                mimeType = probe.container.mimeType,
-                describe = stream.format.summary,
-                downloadFormat = stream.format.downloadBadge(),
-                write = { parts, sink, onProgress ->
-                    ResumableTransfer.download(Http.client, stream.url, stream.headers, File(parts, "audio.part"), onProgress)
-                        .inputStream().use { input -> input.copyTo(sink) }
-                },
-            )
-            is Downloader.Probe.Manifest -> {
-                val dash = probe.dash
-                val assembled = DownloadStore.storable(stream.format.codec)
-                    ?.takeIf { it.extension in ManifestFile.EXTENSIONS }
-                when {
-                    // A manifest's segments are joined back into one ordinary
-                    // file — see [ManifestFile] — exported or not, so a lossless
-                    // download is a `.flac` wherever it lands. Exports used to
-                    // decline manifests instead, which meant YouTube: Tidal
-                    // serves every lossless tier as a manifest, so an exporting
-                    // user heard FLAC and saved 131kbps AAC.
-                    assembled != null -> Route(
-                        extension = assembled.extension,
-                        mimeType = assembled.mimeType,
-                        describe = "${stream.format.summary} (assembled from ${if (dash) "DASH" else "HLS"})",
-                        downloadFormat = stream.format.downloadBadge(),
-                        write = { parts, sink, onProgress ->
-                            ManifestFile.write(
-                                context.cacheDir, stream.url, stream.headers, dash,
-                                assembled.extension, sink, onProgress, File(parts, "segments"),
-                            )
-                        },
-                    )
-                    // Only a codec the assembler can't file gets this far, and
-                    // [keepable] has already kept it out of an export.
-                    AppSettings.exportDownloads.value -> {
-                        Log.d(TAG, "can't export a ${stream.format.summary} manifest for ${track.videoId}")
-                        null
-                    }
-                    // DASH is saved *as* HLS — see [OfflineDash] for why — so
-                    // both kinds land as the same package and are named for
-                    // what was written rather than for what was fetched.
-                    else -> Route(
-                        extension = "m3u8",
-                        mimeType = "application/vnd.apple.mpegurl",
-                        describe = stream.format.summary,
-                        downloadFormat = stream.format.downloadBadge(),
-                        offlineHls = Manifest(stream.url, stream.headers, dash = dash),
-                        write = { _, _, _ -> error("Manifest downloads use their offline package writer") },
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * A route that copies [copy] out of the song cache instead of fetching
-     * anything, or null when it cannot be filed where downloads go: exported
-     * downloads are pinned away from WebM for the same MediaStore reason
-     * [routeFor] gives.
-     */
     private fun cachedRoute(copy: AudioCache.CompleteCopy): Route? {
-        if (copy.extension == "webm" && AppSettings.exportDownloads.value) return null
+        if (copy.extension != "flac") return null
         return Route(
             extension = copy.extension,
             mimeType = copy.mimeType,
             describe = "song cache, ${copy.length} bytes",
-            downloadFormat = if (copy.extension == "flac") "FLAC" else null,
+            downloadFormat = "FLAC",
             write = { _, sink, onProgress -> AudioCache.copyOut(copy, sink, onProgress) },
         )
     }
 
-    /**
-     * The stream to keep for [track] from a configured source, with how to file
-     * it — or null, which is not a failure, just YouTube's turn.
-     *
-     * Usually a bit-exact one; not always. [SourceResolver.forDownload] falls
-     * back to the best lossy copy any enabled source holds when nothing has the
-     * recording losslessly, and only gives up on the sources entirely when what
-     * they offer would not beat YouTube's own AAC. Which of those happened is
-     * the resolver's business — from here it is a URL and a codec either way.
-     *
-     * Bounded, because a module search waits on every backend it has (see
-     * `ModuleSource.SEARCH_PATIENT_MS`) and does that once per query the matcher
-     * offers. The bound is handed *to* the resolver rather than wrapped round
-     * it: wrapped, running out of time threw away every answer already in hand
-     * along with the slow one, and a JioSaavn 320 found in the first second
-     * went to YouTube's Opus because an addon was still thinking.
-     *
-     * Whether a candidate can become a file at all is [keepable]'s question,
-     * and the resolver asks it of every candidate before one may win — see
-     * [SourceResolver.forDownload]'s `keep`.
-     *
-     * @param quality pinned by [run] for the whole of this track. Passed on to
-     *   the resolver rather than left to it, so that the twenty seconds this may
-     *   spend searching cannot be a window in which the setting changes and the
-     *   two halves of one decision disagree.
-     */
+    /** Probe each eligible candidate before selecting it, so a mislabeled stream cannot hide a FLAC. */
     private suspend fun fromSources(track: Song, quality: DownloadQuality): Kept? {
         val target = TrackMatcher.targetOf(track)
         val probes = java.util.concurrent.ConcurrentHashMap<String, Downloader.Probe>()
@@ -1411,11 +1278,12 @@ object Downloads {
                     target,
                     SourceResolver.requestForDownload(quality),
                     keep = { candidate ->
-                        keepable(candidate, target.durationSec)
+                        keepable(candidate)
                             ?.also { probes[it.stream.url] = it.probe }
                             ?.stream
                     },
                     budgetMs = SOURCE_LOOKUP_MS,
+                    onlyFlac = true,
                 )
             } catch (e: CancellationException) {
                 throw e
@@ -1425,7 +1293,7 @@ object Downloads {
             }.also { timedOut = false }
         }
         if (timedOut) {
-            Log.w(TAG, "source lookup for ${track.videoId} overran its own budget; downloading it from YouTube")
+            Log.w(TAG, "source lookup for ${track.videoId} timed out looking for FLAC")
         }
         stream ?: return null
         return probes[stream.url]?.let { Kept(stream, it) }
@@ -1453,64 +1321,21 @@ object Downloads {
             Log.d(TAG, "${track.videoId}: its own source has nothing to download; matching it elsewhere")
             return null
         }
-        return keepable(stream, TrackMatcher.targetOf(track).durationSec)
+        return keepable(stream)
     }
 
-    /**
-     * [stream] as something a download can keep, described by its bytes — or
-     * null when it can't be kept.
-     *
-     * Three things come out of the probe that the source's label couldn't be
-     * trusted with:
-     *
-     *  - **The container.** An addon's `aac` or `mp3` used to have no file
-     *    type to land in at all, so it went to YouTube — while JioSaavn, which
-     *    always says `mp4`, never did. That asymmetry was the whole of "with an
-     *    addon connected it still downloads JioSaavn or Opus".
-     *  - **Whether it is a manifest.** Labels lie about this one in particular;
-     *    see [Downloader.probe].
-     *  - **A codec and bitrate where the source stated neither.** Playback
-     *    accepts an undescribed stream and lets the decoder work it out. A
-     *    download has to name the file and judge it against YouTube first, so
-     *    the codec comes from the bytes and the bitrate from the file's length
-     *    over the track's — marked inferred, as an addon's tier-derived 320 is.
-     */
-    private suspend fun keepable(stream: SourceStream, durationSec: Int?): Kept? {
+    /** Direct files must have FLAC bytes. The manifest assembler verifies FLAC samples before publishing. */
+    private suspend fun keepable(stream: SourceStream): Kept? {
         val probe = Downloader.probe(stream.url, stream.headers, stream.format.codec)
         if (probe == null) {
             Log.d(TAG, "${stream.format.summary}: not a file a download can keep; passing")
             return null
         }
-        val export = AppSettings.exportDownloads.value
         return when (probe) {
-            is Downloader.Probe.Manifest -> {
-                val assembles = DownloadStore.storable(stream.format.codec)?.extension in ManifestFile.EXTENSIONS
-                if (export && !assembles) {
-                    Log.d(TAG, "${stream.format.summary}: a manifest an export can't file; passing")
-                    return null
-                }
-                Kept(stream, probe)
-            }
-            is Downloader.Probe.File -> {
-                val container = probe.container
-                // MediaStore.Audio refuses audio/webm on affected Android
-                // versions — the same reason YouTube's route pins exports to AAC.
-                if (export && container == Downloader.Container.WEBM) {
-                    Log.d(TAG, "${stream.format.summary}: WebM can't be exported; passing")
-                    return null
-                }
-                val described = stream.format.copy(
-                    codec = container.codec ?: stream.format.codec ?: container.extension,
-                )
-                val measured = estimatedKbps(probe.totalBytes, stream.durationSec ?: durationSec)
-                    ?.takeIf { described.kbps == null && described.isLossless != true }
-                val format = if (measured != null) {
-                    described.copy(kbps = measured, kbpsInferred = true)
-                } else {
-                    described
-                }
-                Kept(stream.copy(format = format), probe)
-            }
+            is Downloader.Probe.File -> if (probe.container == Downloader.Container.FLAC)
+                Kept(stream.copy(format = stream.format.copy(codec = "flac")), probe) else null
+            is Downloader.Probe.Manifest -> if (DownloadStore.storable(stream.format.codec)?.extension == "flac")
+                Kept(stream.copy(format = stream.format.copy(codec = "flac")), probe) else null
         }
     }
 
@@ -1594,18 +1419,6 @@ object Downloads {
     private const val LOOKUP_BACKSTOP_MS = 15_000L
 
     /**
-     * The extensions a file in Music can carry that say, on their own, that a
-     * lossless request has already been answered.
-     *
-     * `m4a` is deliberately absent even though an ALAC download is filed as
-     * one: an `.m4a` in this folder is just as likely to be the AAC a
-     * download at the High rung wrote, and there is nothing in the name to
-     * separate them. Guessing wrong there would answer a request for lossless
-     * with a transcode and never fetch the real thing.
-     */
-    private val LOSSLESS_EXTENSIONS = listOf("flac", "wav")
-
-    /**
      * Why a download didn't start, when the reason is a setting rather than a
      * fault.
      *
@@ -1645,6 +1458,7 @@ internal data class SavedSongMetadata(
     val downloadFormat: String? = null,
     /** Stable creation time for downloads that MediaStore does not index. */
     val dateAddedSeconds: Long? = null,
+    val verifiedFlac: Boolean = false,
 )
 
 /**

@@ -169,7 +169,6 @@ import com.music.bitchord.data.settings.AutomixPerformanceMode
 import com.music.bitchord.R
 import com.music.bitchord.data.sources.DeviceCodecs
 import com.music.bitchord.data.settings.AudioQuality
-import com.music.bitchord.data.settings.DownloadQuality
 import com.music.bitchord.data.settings.ThemeMode
 import com.music.bitchord.data.settings.AppFont
 import com.music.bitchord.data.settings.PlayerTheme
@@ -282,7 +281,6 @@ fun SettingsScreen(
     val playingDolbyAtmos = playingFormat?.isDolbyAtmos == true
     val cacheLimitBytes by AppSettings.audioCacheLimitBytes.collectAsStateWithLifecycle()
     val showCacheFolder by AppSettings.showCacheFolder.collectAsStateWithLifecycle()
-    val downloadQuality by AppSettings.downloadQuality.collectAsStateWithLifecycle()
     val wifiOnlyDownloads by AppSettings.wifiOnlyDownloads.collectAsStateWithLifecycle()
     val exportDownloads by AppSettings.exportDownloads.collectAsStateWithLifecycle()
     val syncDownloadedPlaylists by AppSettings.syncDownloadedPlaylists.collectAsStateWithLifecycle()
@@ -610,9 +608,8 @@ fun SettingsScreen(
                 SettingsRow(
                     icon = SfIcons.Download,
                     title = downloadQualityTitle,
-                    subtitle = stringResource(R.string.download_quality_subtitle, downloadQuality.perTrack),
-                    value = downloadQuality.localizedLabel(),
-                    onClick = { onOpenChoice(SettingsChoiceKind.DOWNLOAD_QUALITY) },
+                    subtitle = stringResource(R.string.download_flac_only),
+                    value = "FLAC",
                 )
             }
             // Reads as part of Download quality above it, not as a setting
@@ -2062,15 +2059,6 @@ private fun AudioQuality.localizedLabel(): String = stringResource(
 )
 
 @Composable
-private fun DownloadQuality.localizedLabel(): String = stringResource(
-    when (this) {
-        DownloadQuality.STANDARD -> R.string.standard
-        DownloadQuality.HIGH -> R.string.high
-        DownloadQuality.LOSSLESS -> R.string.lossless
-    },
-)
-
-@Composable
 private fun ThemeMode.localizedLabel(): String = stringResource(
     when (this) {
         ThemeMode.SYSTEM -> R.string.system
@@ -2880,7 +2868,6 @@ enum class SettingsCategory(@param:StringRes val title: Int) {
 enum class SettingsChoiceKind(@param:StringRes val title: Int) {
     AUDIO_QUALITY_WIFI(R.string.on_wifi),
     AUDIO_QUALITY_CELLULAR(R.string.on_mobile_data),
-    DOWNLOAD_QUALITY(R.string.download_quality),
     AUTOMIX_PERFORMANCE(R.string.automix_performance),
     BIT_PERFECT(R.string.bit_perfect_output),
     USB_VOLUME(R.string.usb_direct_volume_mode),
@@ -2962,23 +2949,6 @@ fun SettingsChoicePage(
                     // which sources a rung consults is read per stream off the
                     // connection in force; see [AudioQuality.permits].
                     if (wifi) AppSettings.setAudioQualityWifi(quality) else AppSettings.setAudioQualityCellular(quality)
-                    onChosen()
-                }
-            }
-
-            // Priced per track rather than per hour, unlike the streaming
-            // ceilings: a stream is paid for again on every replay, a download
-            // once. Same list, different question.
-            SettingsChoiceKind.DOWNLOAD_QUALITY -> {
-                val selected by AppSettings.downloadQuality.collectAsStateWithLifecycle()
-                ChoiceGroup(
-                    options = DownloadQuality.entries.reversed(),
-                    selected = selected,
-                    label = { it.localizedLabel() },
-                    detail = { stringResource(R.string.quality_per_track, it.detail, it.perTrack) },
-                    footer = stringResource(R.string.download_quality_dialog_subtitle),
-                ) { quality ->
-                    AppSettings.setDownloadQuality(quality)
                     onChosen()
                 }
             }
