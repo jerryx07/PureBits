@@ -2132,7 +2132,6 @@ fun NowPlayingScreen(
                                         onArtState = art::onState,
                                         isPlaying = isPlaying && !isLoading && !overlayOpen.value,
                                         position = position,
-                                        progress = shown,
                                     )
                                 }
                             } else null,
@@ -3366,7 +3365,6 @@ fun NowPlayingScreen(
                                     onArtState = art::onState,
                                     isPlaying = isPlaying && !isLoading && !overlayOpen.value,
                                     position = position,
-                                    progress = shown,
                                 )
                             } else {
                                 // Empty state lives on this tile, not the AsyncImage: a
