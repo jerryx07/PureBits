@@ -174,6 +174,7 @@ import com.music.bitchord.data.lyrics.LyricLine
 import com.music.bitchord.data.lyrics.LyricsSource
 import com.music.bitchord.data.settings.LastPlayerScreen
 import com.music.bitchord.data.settings.PlayerTheme
+import com.music.bitchord.data.settings.PlayerStyle
 import com.music.bitchord.data.model.LikeStatus
 import com.music.bitchord.data.model.PlaybackSourceType
 import com.music.bitchord.data.model.PLAYER_ART_PX
@@ -949,10 +950,13 @@ fun NowPlayingScreen(
     // A music video plays its own picture where the sleeve is — see
     // [MusicVideoSurface] — and takes the place of any animated cover.
     val videoMode = showsMusicVideo(song)
+    val playerStyle by PlayerSettings.playerStyle.collectAsStateWithLifecycle()
+    val vinylMode = playerStyle == PlayerStyle.VINYL && !videoMode
     // Square video thumbnails: the picture takes the sleeve's own slot, cropped
     // to it, in place of the full-width box at the video's shape.
     val squareVideo = videoMode && VideoThumbnails.square
-    val canvas = rememberCanvasArtwork(song)?.takeUnless { videoMode }?.let {
+    // Vinyl is a still-art treatment; keep the saved Canvas preference intact.
+    val canvas = if (vinylMode) null else rememberCanvasArtwork(song)?.takeUnless { videoMode }?.let {
         // Apple's 3:4 rendition runs under the whole phone screen, the way its
         // own player shows it; the square one stays the fallback.
         val tall = it.portraitUrl
@@ -1410,7 +1414,7 @@ fun NowPlayingScreen(
     // still-art full-bleed preference. Other providers and static artwork keep
     // answering to that preference exactly as before.
     // A music video sits in the card's place at its own 16:9, never full bleed.
-    val heroMode = !videoMode && (
+    val heroMode = !videoMode && !vinylMode && (
         spotifyCanvasOnPhone ||
             (fullBleedArt && playerFillsWindow(windowWidth))
         )
@@ -1847,6 +1851,8 @@ fun NowPlayingScreen(
     // the trip, as for the collapse into the lyrics or the queue; a paused
     // clip keeps its last frame, so nothing blinks.
     val dockMoving by remember { derivedStateOf { docking() } }
+    // Keep original square artwork in panels and while docking into the mini player.
+    val vinylExpanded = vinylMode && !collapsePastHalf && !dockMoving && !lyricsOpen && !queueOpen
     // The rest of the player gets out of the way a little ahead of the artwork,
     // so the cover lands on the bar rather than on a ghost of the player.
     val dockFade: () -> Float = { ((dockT() - DOCK_FADE_LEAD) / (1f - DOCK_FADE_LEAD)).coerceIn(0f, 1f) }
@@ -2118,6 +2124,18 @@ fun NowPlayingScreen(
                             // Let go of on the way to the mini player, whose
                             // cover sits flat in its bar.
                             shadowFraction = dockT,
+                            vinylContent = if (vinylExpanded) {
+                                {
+                                    VinylArtwork(
+                                        artRequest = art.request,
+                                        artLoaded = art.loaded,
+                                        onArtState = art::onState,
+                                        isPlaying = isPlaying && !isLoading && !overlayOpen.value,
+                                        position = position,
+                                        progress = shown,
+                                    )
+                                }
+                            } else null,
                             modifier = artworkModifier
                                 .then(
                                     if (dock != null) {
@@ -3295,7 +3313,7 @@ fun NowPlayingScreen(
                                     // collapse, once the dissolve has all but gone. Let
                                     // go of on the way to the mini player, whose cover
                                     // sits flat in its bar.
-                                    shadowElevation = if (art.loaded) {
+                                    shadowElevation = if (art.loaded && !vinylExpanded) {
                                         10.dp.toPx() * (1f - 2f * shown).coerceAtLeast(0f) * dockT()
                                     } else {
                                         0f
@@ -3341,162 +3359,173 @@ fun NowPlayingScreen(
                                     }
                                 },
                         ) {
-                            // Empty state lives on this tile, not the AsyncImage: a
-                            // background *and* a painter both trying to fill the same
-                            // clipped shape is what read as two overlapping squares
-                            // whenever there was nothing to paint. One layer, one square.
-                            //
-                            // Kept at the card's place and size however much of the
-                            // banner the sleeve is standing in for: a placeholder is a
-                            // card or it is nothing, and blown out to the banner it
-                            // would only tint the top third of the screen. Under the
-                            // cover, which hides it the moment there is one.
-                            Box(
-                                modifier = Modifier
-                                    // As wide as the sleeve, for the same reason the
-                                    // sleeve is as wide as its box: right to left.
-                                    .layout { measurable, constraints ->
-                                        val card = towardsDock(cardRect(), dockFrame.miniInBox)
-                                        val sleeve = dockFrame.sleeve
-                                        val placeable = measurable.measure(
-                                            Constraints.fixed(card.width.roundToInt(), card.height.roundToInt()),
-                                        )
-                                        layout(constraints.maxWidth, 0) {
-                                            placeable.place(
-                                                (card.left - sleeve.left).roundToInt(),
-                                                (card.top - sleeve.top).roundToInt(),
-                                            )
-                                        }
-                                    }
-                                    .graphicsLayer {
-                                        // The card's own shrink and nudge, where the
-                                        // sleeve around it is not taking them.
-                                        val share = bannerShare()
-                                        val idle = cardScale()
-                                        val t = dockT()
-                                        val scale = if (t >= 1f) {
-                                            idle / (idle + (1f - idle) * share)
-                                        } else {
-                                            (1f + (idle - 1f) * t) / (1f + (idle + (1f - idle) * share - 1f) * t)
-                                        }
-                                        scaleX = scale
-                                        scaleY = scale
-                                        translationX = swipeSettle.value * (1f - p()) * share * t
-                                        // Its own corners only once it is smaller than
-                                        // the sleeve; as the whole card it takes the
-                                        // sleeve's clip, as it always did.
-                                        shape = TileShape
-                                        clip = share > 0f
-                                    }
-                                    .background(Color.Black.copy(alpha = 0.18f)),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                if (!art.loaded && !canvasRendered) {
-                                    Icon(
-                                        imageVector = BitChordIcons.MusicNote,
-                                        contentDescription = null,
-                                        tint = Color.White.copy(alpha = 0.35f),
-                                        modifier = Modifier
-                                            .size(40.dp)
-                                            .graphicsLayer {
-                                                val scale = 1f - 0.5f * p()
-                                                scaleX = scale
-                                                scaleY = scale
-                                            },
-                                    )
-                                }
-                            }
-                            AsyncImage(
-                                // Decode at the sleeve's *expanded* size, always.
-                                // Coil otherwise sizes the decode to however large
-                                // this is when the request goes out — and changing
-                                // track from the queue does that while the sleeve is
-                                // collapsed to a thumbnail, leaving a thumbnail-sized
-                                // bitmap to be blown back up when the queue closes.
-                                // Skipping tracks with the transport keeps it sharp
-                                // only because the sleeve happens to be full size at
-                                // that moment.
+                            if (vinylExpanded) {
+                                VinylArtwork(
+                                    artRequest = art.request,
+                                    artLoaded = art.loaded,
+                                    onArtState = art::onState,
+                                    isPlaying = isPlaying && !isLoading && !overlayOpen.value,
+                                    position = position,
+                                    progress = shown,
+                                )
+                            } else {
+                                // Empty state lives on this tile, not the AsyncImage: a
+                                // background *and* a painter both trying to fill the same
+                                // clipped shape is what read as two overlapping squares
+                                // whenever there was nothing to paint. One layer, one square.
                                 //
-                                // Asked for at the source's own size rather than the
-                                // sleeve's: the banner is taller than the card is
-                                // wide, and the one bitmap has to serve both shapes
-                                // with nothing to upscale between them.
-                                model = art.request,
-                                contentDescription = null,
-                                // Video thumbnails are 16:9; letterboxing them inside
-                                // the square sleeve looks like a broken frame.
-                                contentScale = ContentScale.Crop,
-                                onState = art::onState,
-                                // TextureView-backed canvas frames can arrive
-                                // before Coil has decoded the sleeve. Alpha alone
-                                // doesn't hide this layer for that window: a
-                                // TextureView composites through its own hardware
-                                // layer, and on some devices that layer wins the
-                                // stacking order against a sibling Compose layer
-                                // even when that layer's alpha is zero — so the
-                                // still image's empty placeholder still shows
-                                // through, above a perfectly healthy animated
-                                // cover. Skipping the draw call outright leaves
-                                // nothing there to composite, in the wrong order
-                                // or otherwise; the request stays mounted so
-                                // loading still finishes in the background and
-                                // [PlayerArtwork.loaded] still flips the moment it does.
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .drawWithContent {
-                                        val frame = still()
-                                        if (frame == null) {
-                                            if (art.loaded || !canvasRendered) drawContent()
-                                        } else if (
-                                            // The clip's still in place of the cover —
-                                            // see [stillTakesOver] — and, for the reason
-                                            // above, drawn only while it can be seen.
-                                            stillTakesOver() || !canvasRendered ||
-                                            (heroMode && canvasCover.floatValue < 1f)
-                                        ) {
-                                            drawCropped(frame.image)
+                                // Kept at the card's place and size however much of the
+                                // banner the sleeve is standing in for: a placeholder is a
+                                // card or it is nothing, and blown out to the banner it
+                                // would only tint the top third of the screen. Under the
+                                // cover, which hides it the moment there is one.
+                                Box(
+                                    modifier = Modifier
+                                        // As wide as the sleeve, for the same reason the
+                                        // sleeve is as wide as its box: right to left.
+                                        .layout { measurable, constraints ->
+                                            val card = towardsDock(cardRect(), dockFrame.miniInBox)
+                                            val sleeve = dockFrame.sleeve
+                                            val placeable = measurable.measure(
+                                                Constraints.fixed(card.width.roundToInt(), card.height.roundToInt()),
+                                            )
+                                            layout(constraints.maxWidth, 0) {
+                                                placeable.place(
+                                                    (card.left - sleeve.left).roundToInt(),
+                                                    (card.top - sleeve.top).roundToInt(),
+                                                )
+                                            }
                                         }
-                                    },
-                            )
-
-                            // Where the clip plays when it can't have the banner:
-                            // inside the same clip as the still art, taking the
-                            // sleeve's corners, shadow and paused shrink for free.
-                            if (!heroMode && canvas != null) {
-                                WhileShown({ !collapsePastHalf }) {
-                                    val stillStart = remember(canvas.url) { stillAtMount() }
-                                    CanvasArtworkPlayer(
-                                        canvas = canvas,
-                                        isPlaying = isPlaying,
-                                        // The panels first: a collapse the tap asked
-                                        // for is paused from the tap, and then never
-                                        // asks after its first frame of movement.
-                                        pausedForTransition = lyricsOpen || queueOpen || queueDragging ||
-                                            collapseStarted || dockMoving || overlayOpen.value,
-                                        // The same stand-in as the banner's clip; here
-                                        // the still is drawn by the sleeve around it.
-                                        presentationAlpha = { if (stillTakesOver()) 0f else 1f },
-                                        startPositionMs = stillStart?.positionMs ?: 0L,
-                                        revealInstantly = stillStart != null,
-                                        captureStill = stillMoving,
-                                        onStillCaptured = onStillCaptured,
-                                        onResumed = onClipResumed,
-                                        onRenderedChanged = { canvasRendered = it },
-                                        frameCapturePx = if (tintsOffClip && !tabletArtworkBackdrop) {
-                                            CANVAS_FRAME_CAPTURE_PX
-                                        } else {
-                                            0
-                                        },
-                                        onFrameCaptured = {
-                                            if (!tabletArtworkBackdrop && !lyricsOpen && !queueOpen) {
-                                                canvasFrame = it
+                                        .graphicsLayer {
+                                            // The card's own shrink and nudge, where the
+                                            // sleeve around it is not taking them.
+                                            val share = bannerShare()
+                                            val idle = cardScale()
+                                            val t = dockT()
+                                            val scale = if (t >= 1f) {
+                                                idle / (idle + (1f - idle) * share)
+                                            } else {
+                                                (1f + (idle - 1f) * t) / (1f + (idle + (1f - idle) * share - 1f) * t)
+                                            }
+                                            scaleX = scale
+                                            scaleY = scale
+                                            translationX = swipeSettle.value * (1f - p()) * share * t
+                                            // Its own corners only once it is smaller than
+                                            // the sleeve; as the whole card it takes the
+                                            // sleeve's clip, as it always did.
+                                            shape = TileShape
+                                            clip = share > 0f
+                                        }
+                                        .background(Color.Black.copy(alpha = 0.18f)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (!art.loaded && !canvasRendered) {
+                                        Icon(
+                                            imageVector = BitChordIcons.MusicNote,
+                                            contentDescription = null,
+                                            tint = Color.White.copy(alpha = 0.35f),
+                                            modifier = Modifier
+                                                .size(40.dp)
+                                                .graphicsLayer {
+                                                    val scale = 1f - 0.5f * p()
+                                                    scaleX = scale
+                                                    scaleY = scale
+                                                },
+                                        )
+                                    }
+                                }
+                                AsyncImage(
+                                    // Decode at the sleeve's *expanded* size, always.
+                                    // Coil otherwise sizes the decode to however large
+                                    // this is when the request goes out — and changing
+                                    // track from the queue does that while the sleeve is
+                                    // collapsed to a thumbnail, leaving a thumbnail-sized
+                                    // bitmap to be blown back up when the queue closes.
+                                    // Skipping tracks with the transport keeps it sharp
+                                    // only because the sleeve happens to be full size at
+                                    // that moment.
+                                    //
+                                    // Asked for at the source's own size rather than the
+                                    // sleeve's: the banner is taller than the card is
+                                    // wide, and the one bitmap has to serve both shapes
+                                    // with nothing to upscale between them.
+                                    model = art.request,
+                                    contentDescription = null,
+                                    // Video thumbnails are 16:9; letterboxing them inside
+                                    // the square sleeve looks like a broken frame.
+                                    contentScale = ContentScale.Crop,
+                                    onState = art::onState,
+                                    // TextureView-backed canvas frames can arrive
+                                    // before Coil has decoded the sleeve. Alpha alone
+                                    // doesn't hide this layer for that window: a
+                                    // TextureView composites through its own hardware
+                                    // layer, and on some devices that layer wins the
+                                    // stacking order against a sibling Compose layer
+                                    // even when that layer's alpha is zero — so the
+                                    // still image's empty placeholder still shows
+                                    // through, above a perfectly healthy animated
+                                    // cover. Skipping the draw call outright leaves
+                                    // nothing there to composite, in the wrong order
+                                    // or otherwise; the request stays mounted so
+                                    // loading still finishes in the background and
+                                    // [PlayerArtwork.loaded] still flips the moment it does.
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .drawWithContent {
+                                            val frame = still()
+                                            if (frame == null) {
+                                                if (art.loaded || !canvasRendered) drawContent()
+                                            } else if (
+                                                // The clip's still in place of the cover —
+                                                // see [stillTakesOver] — and, for the reason
+                                                // above, drawn only while it can be seen.
+                                                stillTakesOver() || !canvasRendered ||
+                                                (heroMode && canvasCover.floatValue < 1f)
+                                            ) {
+                                                drawCropped(frame.image)
                                             }
                                         },
-                                        refreshFrameEveryMs = if (
-                                            tabletArtworkBackdrop || lyricsOpen || queueOpen || dockMoving
-                                        ) null else meshRefreshMs,
-                                        modifier = Modifier.fillMaxSize(),
-                                    )
+                                )
+
+                                // Where the clip plays when it can't have the banner:
+                                // inside the same clip as the still art, taking the
+                                // sleeve's corners, shadow and paused shrink for free.
+                                if (!heroMode && canvas != null) {
+                                    WhileShown({ !collapsePastHalf }) {
+                                        val stillStart = remember(canvas.url) { stillAtMount() }
+                                        CanvasArtworkPlayer(
+                                            canvas = canvas,
+                                            isPlaying = isPlaying,
+                                            // The panels first: a collapse the tap asked
+                                            // for is paused from the tap, and then never
+                                            // asks after its first frame of movement.
+                                            pausedForTransition = lyricsOpen || queueOpen || queueDragging ||
+                                                collapseStarted || dockMoving || overlayOpen.value,
+                                            // The same stand-in as the banner's clip; here
+                                            // the still is drawn by the sleeve around it.
+                                            presentationAlpha = { if (stillTakesOver()) 0f else 1f },
+                                            startPositionMs = stillStart?.positionMs ?: 0L,
+                                            revealInstantly = stillStart != null,
+                                            captureStill = stillMoving,
+                                            onStillCaptured = onStillCaptured,
+                                            onResumed = onClipResumed,
+                                            onRenderedChanged = { canvasRendered = it },
+                                            frameCapturePx = if (tintsOffClip && !tabletArtworkBackdrop) {
+                                                CANVAS_FRAME_CAPTURE_PX
+                                            } else {
+                                                0
+                                            },
+                                            onFrameCaptured = {
+                                                if (!tabletArtworkBackdrop && !lyricsOpen && !queueOpen) {
+                                                    canvasFrame = it
+                                                }
+                                            },
+                                            refreshFrameEveryMs = if (
+                                                tabletArtworkBackdrop || lyricsOpen || queueOpen || dockMoving
+                                            ) null else meshRefreshMs,
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+                                    }
                                 }
                             }
                         }
