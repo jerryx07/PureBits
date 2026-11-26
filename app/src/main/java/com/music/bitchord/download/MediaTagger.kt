@@ -164,7 +164,9 @@ object MediaTagger {
         if (sourceUrl.isNullOrBlank()) return null
         artworkFile(context, sourceUrl).takeIf { it.length() > 0 }?.let { return Uri.fromFile(it).toString() }
         if (!allowNetwork) return null
-        val artwork = fetchCover(sourceUrl.artworkAt(1200) ?: sourceUrl, "collection") ?: return null
+        val large = sourceUrl.artworkAt(1200)
+        val artwork = large?.takeIf { it != sourceUrl }?.let { fetchCover(it, "collection") }
+            ?: fetchCover(sourceUrl, "collection") ?: return null
         return persistArtwork(context, sourceUrl, artwork)
     }
 

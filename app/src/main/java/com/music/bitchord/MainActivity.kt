@@ -901,10 +901,11 @@ private fun BitChordApp(
     val addonResults by viewModel.addonResults.collectAsStateWithLifecycle()
     // Collected rather than read once, so addon rows in search re-dim the
     // moment the quality setting, the connection or the watch's cap moves.
+    val meteredConnection by AppSettings.meteredConnection.collectAsStateWithLifecycle()
     val addonCeiling = AppSettings.ceilingFor(
         wifi = AppSettings.audioQualityWifi.collectAsStateWithLifecycle().value,
         cellular = AppSettings.audioQualityCellular.collectAsStateWithLifecycle().value,
-        metered = AppSettings.meteredConnection.collectAsStateWithLifecycle().value,
+        metered = meteredConnection,
         override = AppSettings.streamCeilingOverride.collectAsStateWithLifecycle().value,
     )
     val signedIn by viewModel.signedIn.collectAsStateWithLifecycle()
@@ -1052,7 +1053,7 @@ private fun BitChordApp(
         id?.let { Downloads.recordIdOf(it) ?: it }?.takeIf { it in savedCollections }
     }
     val downloadRows = (topDetail?.takeIf { it.browseId == "local:downloads" }?.songs as? UiState.Success)?.data.orEmpty()
-    LaunchedEffect(remember(downloadRows) { downloadRows.map { it.localUri } }) {
+    LaunchedEffect(remember(downloadRows) { downloadRows.map { it.localUri } }, meteredConnection != null) {
         viewModel.recoverDownloadArtwork(downloadRows)
     }
     LaunchedEffect(savedDownloads, savedCollections, topDetail?.browseId) {
@@ -2506,7 +2507,7 @@ private fun BitChordApp(
     var localCover by remember(playingTrack?.videoId, playingTrack?.localUri, playingTrack?.thumbnailUrl) {
         mutableStateOf<String?>(null)
     }
-    LaunchedEffect(playingTrack?.videoId, playingTrack?.localUri, playingTrack?.thumbnailUrl) {
+    LaunchedEffect(playingTrack?.videoId, playingTrack?.localUri, playingTrack?.thumbnailUrl, meteredConnection != null) {
         val uri = playingTrack?.localUri ?: return@LaunchedEffect
         if (uri.startsWith("file://") || uri.startsWith("content://")) {
             localCover = viewModel.downloadArtwork(playingTrack)

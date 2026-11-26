@@ -67,6 +67,5 @@ AGENTS.md
 *.key
 .cloudflared/
 .private/
-personal/private/
-personal/deploy/*.local
-personal
+# The self-hosted web player has its own private repository.
+/personal/
