@@ -617,6 +617,9 @@ object AppSettings {
      */
     val playerTheme = MutableStateFlow(PlayerTheme.DEFAULT)
 
+    /** Visual artwork treatment only; never changes playback. */
+    val playerStyle = MutableStateFlow(PlayerStyle.CLASSIC)
+
     /** Restores the expanded player to the surface the listener left open. */
     val lastPlayerScreen = MutableStateFlow(LastPlayerScreen.MAIN)
 
@@ -1081,6 +1084,9 @@ object AppSettings {
         }.getOrElse {
             if (prefs.getBoolean(KEY_LEGACY_MESH_GRADIENT, false)) PlayerTheme.LEGACY else PlayerTheme.DEFAULT
         }
+        playerStyle.value = runCatching {
+            PlayerStyle.valueOf(prefs.getString(KEY_PLAYER_STYLE, null).orEmpty())
+        }.getOrDefault(PlayerStyle.CLASSIC)
         lastPlayerScreen.value = runCatching {
             LastPlayerScreen.valueOf(
                 prefs.getString(KEY_LAST_PLAYER_SCREEN, null) ?: LastPlayerScreen.MAIN.name,
@@ -1729,6 +1735,11 @@ object AppSettings {
         prefs.edit().putString(KEY_PLAYER_THEME, value.name).apply()
     }
 
+    fun setPlayerStyle(value: PlayerStyle) {
+        playerStyle.value = value
+        prefs.edit().putString(KEY_PLAYER_STYLE, value.name).apply()
+    }
+
     fun setLastPlayerScreen(value: LastPlayerScreen) {
         if (lastPlayerScreen.value == value) return
         lastPlayerScreen.value = value
@@ -2340,6 +2351,7 @@ object AppSettings {
     private const val KEY_FULL_BLEED_ARTWORK = "full_bleed_artwork"
     private const val KEY_FULL_BLEED_DETAIL_ARTWORK = "full_bleed_detail_artwork"
     private const val KEY_PLAYER_THEME = "player_theme"
+    private const val KEY_PLAYER_STYLE = "player_style"
     private const val KEY_LEGACY_MESH_GRADIENT = "legacy_mesh_gradient"
     private const val KEY_LAST_PLAYER_SCREEN = "last_player_screen"
     private const val KEY_SYNCED_LYRICS = "synced_lyrics"

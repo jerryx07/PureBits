@@ -39,6 +39,9 @@ enum class PlayerTheme {
     SIMPLE,
 }
 
+/** Artwork presentation, independent of the player background theme. */
+enum class PlayerStyle { CLASSIC, VINYL }
+
 /** The surface that was last open inside the expanded player. */
 enum class LastPlayerScreen {
     MAIN,

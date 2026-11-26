@@ -294,9 +294,10 @@ internal fun LandscapeArtwork(
     sleeveShape: () -> Shape = { LandscapeArtShape },
     /** How much of the sleeve's shadow is cast, 1 at rest. */
     shadowFraction: () -> Float = { 1f },
+    vinylContent: (@Composable () -> Unit)? = null,
     overlay: @Composable BoxScope.() -> Unit = {},
 ) {
-    val casts = artLoaded || canvasRendered
+    val casts = vinylContent == null && (artLoaded || canvasRendered)
     Box(modifier = modifier) {
         Box(
             modifier = Modifier
@@ -317,36 +318,40 @@ internal fun LandscapeArtwork(
                     shape = sleeveShape()
                     clip = true
                 }
-                .background(Color.Black.copy(alpha = 0.18f)),
+                .background(if (vinylContent == null) Color.Black.copy(alpha = 0.18f) else Color.Transparent),
             contentAlignment = Alignment.Center,
         ) {
-            if (!artLoaded && !canvasRendered) {
-                Icon(
-                    imageVector = BitChordIcons.MusicNote,
+            if (vinylContent != null) {
+                vinylContent()
+            } else {
+                if (!artLoaded && !canvasRendered) {
+                    Icon(
+                        imageVector = BitChordIcons.MusicNote,
+                        contentDescription = null,
+                        tint = Color.White.copy(alpha = 0.35f),
+                        modifier = Modifier.fillMaxSize(0.36f),
+                    )
+                }
+                AsyncImage(
+                    model = artRequest,
                     contentDescription = null,
-                    tint = Color.White.copy(alpha = 0.35f),
-                    modifier = Modifier.fillMaxSize(0.36f),
+                    contentScale = ContentScale.Crop,
+                    onState = onArtState,
+                    // Not drawn under a clip that got there first — see the
+                    // portrait sleeve's note on TextureView stacking order.
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .drawWithContent { if (artLoaded || !canvasRendered) drawContent() },
                 )
-            }
-            AsyncImage(
-                model = artRequest,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                onState = onArtState,
-                // Not drawn under a clip that got there first — see the
-                // portrait sleeve's note on TextureView stacking order.
-                modifier = Modifier
-                    .fillMaxSize()
-                    .drawWithContent { if (artLoaded || !canvasRendered) drawContent() },
-            )
-            canvas?.let { clip ->
-                CanvasArtworkPlayer(
-                    canvas = clip,
-                    isPlaying = isPlaying,
-                    pausedForTransition = pausedForTransition,
-                    onRenderedChanged = onCanvasRenderedChange,
-                    modifier = Modifier.fillMaxSize(),
-                )
+                canvas?.let { clip ->
+                    CanvasArtworkPlayer(
+                        canvas = clip,
+                        isPlaying = isPlaying,
+                        pausedForTransition = pausedForTransition,
+                        onRenderedChanged = onCanvasRenderedChange,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
             }
         }
         overlay()

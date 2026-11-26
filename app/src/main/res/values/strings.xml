@@ -383,6 +383,10 @@
     <string name="glass_performance">Better Performance for Glass</string>
     <string name="liquid_glass_unavailable">Requires Android 12 or newer</string>
     <string name="full_screen_cover_art">Full-screen cover art</string>
+    <string name="player_style">Player style</string>
+    <string name="player_style_classic">Classic</string>
+    <string name="player_style_vinyl">Vinyl</string>
+    <string name="player_style_subtitle">Vinyl replaces the cover with a rotating record; music videos keep their original view.</string>
     <string name="player_theme">Player theme</string>
     <string name="player_theme_default">Default</string>
     <string name="player_theme_legacy">Legacy</string>

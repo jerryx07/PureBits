@@ -172,6 +172,7 @@ import com.music.bitchord.data.settings.AudioQuality
 import com.music.bitchord.data.settings.ThemeMode
 import com.music.bitchord.data.settings.AppFont
 import com.music.bitchord.data.settings.PlayerTheme
+import com.music.bitchord.data.settings.PlayerStyle
 import com.music.bitchord.data.stats.Backup
 import com.music.bitchord.playback.AudioCache
 import com.music.bitchord.ui.player.fullBleedArtworkAvailable
@@ -258,6 +259,7 @@ fun SettingsScreen(
     val fullBleedArtwork by AppSettings.fullBleedArtwork.collectAsStateWithLifecycle()
     val fullBleedDetailArtwork by AppSettings.fullBleedDetailArtwork.collectAsStateWithLifecycle()
     val playerTheme by AppSettings.playerTheme.collectAsStateWithLifecycle()
+    val playerStyle by AppSettings.playerStyle.collectAsStateWithLifecycle()
     val syncedLyrics by AppSettings.syncedLyrics.collectAsStateWithLifecycle()
     val lyricsSources by AppSettings.lyricsSources.collectAsStateWithLifecycle()
     val translationLanguage by AppSettings.translationLanguage.collectAsStateWithLifecycle()
@@ -1155,6 +1157,20 @@ fun SettingsScreen(
                         )
                     },
                     onClick = { AppSettings.setFullBleedDetailArtwork(!fullBleedDetailArtwork) },
+                )
+            }
+            val playerStyleTitle = stringResource(R.string.player_style)
+            row(playerStyleTitle, "artwork", "player", "classic", "vinyl", "record", "turntable") {
+                SettingsRow(
+                    icon = SfIcons.Gradient,
+                    title = playerStyleTitle,
+                    subtitle = stringResource(R.string.player_style_subtitle),
+                )
+                SegmentedControl(
+                    options = listOf(stringResource(R.string.player_style_classic), stringResource(R.string.player_style_vinyl)),
+                    selectedIndex = PlayerStyle.entries.indexOf(playerStyle),
+                    onSelect = { AppSettings.setPlayerStyle(PlayerStyle.entries[it]) },
+                    modifier = Modifier.padding(start = ROW_INSET, end = ROW_INSET, bottom = 14.dp),
                 )
             }
             val playerThemeTitle = stringResource(R.string.player_theme)
